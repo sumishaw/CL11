@@ -22,11 +22,7 @@ class CaptionLensApp extends StatelessWidget {
       );
 }
 
-// ── Model / server state machine ───────────────────────────────────────────────
-
 enum ModelState { checking, notDownloaded, downloading, ready, reconnecting, error }
-
-// ── Home page ──────────────────────────────────────────────────────────────────
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -38,7 +34,6 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _ch = MethodChannel('overlay_channel');
 
-  // UI state
   String originalText     = '';
   String displayText      = 'Tap START → approve screen capture → play any video…';
   bool   isRunning        = false;
@@ -49,17 +44,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool   _micPulse        = false;
   Timer? _pulseTimer;
 
-  // Fast polling — every 500 ms while running
   Timer? _pollTimer;
-  // Track last seen translation to avoid redundant setState calls
   String _lastSeenHindi = '';
 
-  // Whisper server state
   ModelState modelState   = ModelState.checking;
   int downloadPercent     = 0;
   String modelErrorMsg    = '';
-
-  // ── init ──────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
@@ -109,8 +99,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  // ── Platform calls ─────────────────────────────────────────────────────────
-
   Future<void> _checkPermissions() async {
     try {
       final ok = await _ch.invokeMethod<bool>('hasOverlayPermission') ?? false;
@@ -156,14 +144,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
-  // ── Fast polling ───────────────────────────────────────────────────────────
-  // Poll every 500 ms as a fallback safety net in case a push notification
-  // is dropped (e.g. during heavy UI frame drops). This ensures the Flutter
-  // UI always catches up within half a second at worst.
-
   void _startPolling() {
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+    // 200 ms poll — subtitle appears within 200 ms of result being ready
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 200), (_) async {
       if (!isRunning || !mounted) return;
       try {
         final result = await _ch.invokeMethod<Map>('getLatestTranslation');
@@ -180,8 +164,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _pollTimer?.cancel();
     _pollTimer = null;
   }
-
-  // ── Start / stop ───────────────────────────────────────────────────────────
 
   Future<void> _setLanguage(String lang) async {
     await _ch.invokeMethod('setTargetLanguage', {'language': lang});
@@ -255,8 +237,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -305,8 +285,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  // ── Header ─────────────────────────────────────────────────────────────────
-
   Widget _buildHeader() {
     return Row(children: [
       AnimatedContainer(
@@ -346,8 +324,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ]);
   }
 
-  // ── Info banner ────────────────────────────────────────────────────────────
-
   Widget _buildInfoBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
@@ -368,8 +344,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
     ]),
   );
-
-  // ── Model / Whisper server card ────────────────────────────────────────────
 
   Widget _buildModelCard() {
     switch (modelState) {
@@ -530,8 +504,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  // ── Overlay permission row ─────────────────────────────────────────────────
-
   Widget _buildOverlayPermRow() => Container(
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
     decoration: BoxDecoration(
@@ -574,8 +546,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ]),
   );
 
-  // ── Language chips ─────────────────────────────────────────────────────────
-
   Widget _buildLanguageChips() => Container(
     padding: const EdgeInsets.all(14),
     decoration: BoxDecoration(
@@ -606,8 +576,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ]),
   );
 
-  // ── Language selector ──────────────────────────────────────────────────────
-
   Widget _buildLangSelector() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -622,8 +590,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ]),
     ],
   );
-
-  // ── Detected audio ─────────────────────────────────────────────────────────
 
   Widget _buildDetectedAudio() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -642,8 +608,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ],
   );
 
-  // ── Translation output ─────────────────────────────────────────────────────
-
   Widget _buildTranslationOutput() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -654,7 +618,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
       const SizedBox(height: 6),
       AnimatedSwitcher(
-        duration: const Duration(milliseconds: 200),
+        duration: const Duration(milliseconds: 80), // fast subtitle flip
         child: Container(
           key: ValueKey(displayText),
           width: double.infinity,
@@ -675,8 +639,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ],
   );
 
-  // ── Status banner ──────────────────────────────────────────────────────────
-
   Widget _buildStatusBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
@@ -694,10 +656,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ]),
   );
 
-  // ── Start / Stop button ────────────────────────────────────────────────────
-
   Widget _buildStartStopButton() {
-    final busy = modelState == ModelState.downloading || modelState == ModelState.checking || modelState == ModelState.reconnecting;
+    final busy = modelState == ModelState.downloading ||
+        modelState == ModelState.checking ||
+        modelState == ModelState.reconnecting;
     return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
@@ -723,8 +685,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
     );
   }
-
-  // ── Small widgets ──────────────────────────────────────────────────────────
 
   Widget _chip(String label) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
