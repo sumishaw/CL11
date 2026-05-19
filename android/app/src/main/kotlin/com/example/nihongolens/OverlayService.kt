@@ -125,25 +125,22 @@ class OverlayService : Service() {
 
     /**
      * Called on main thread for every new translation from Whisper.
-     *
-     * Shows the full sentence immediately. Cancels any pending clear timer
-     * and restarts it. If silent for SILENCE_MS, fades out.
+     * Shows ONLY the Hindi translation — no source language text shown.
+     * The source text field (srcTv) is intentionally left blank always.
      */
     private fun onNewText(original: String, hindi: String) {
         if (hindi.isBlank()) return
 
-        // Cancel pending display-clear and silence timers
         displayRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
 
-        // Show source text (smaller, grey) + Hindi text (large, white) instantly
-        srcTv?.text   = original.trim()
+        // Show ONLY Hindi — source language (Japanese/English/etc.) never shown
+        srcTv?.text   = ""        // always blank — no dual-language display
         hindiTv?.text = hindi.trim()
 
         showOverlay()
         rescheduleSilence()
 
-        // Auto-clear after DISPLAY_MS if no new translation arrives
         displayRunnable = Runnable {
             srcTv?.text   = ""
             hindiTv?.text = ""
