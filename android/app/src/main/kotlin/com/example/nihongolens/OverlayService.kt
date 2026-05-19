@@ -65,10 +65,12 @@ class OverlayService : Service() {
         }
     }
 
-    // How long each subtitle stays before fading (if no new one arrives)
-    private val DISPLAY_MS = 2_500L
+    // How long each subtitle stays before fading (if no new one arrives).
+    // Matches the 3s chunk duration so every subtitle is readable before
+    // the next one arrives.
+    private val DISPLAY_MS = 3_500L
     // Fade out after this much silence
-    private val SILENCE_MS = 5_000L
+    private val SILENCE_MS = 6_000L
 
     private var windowManager: WindowManager?              = null
     private var overlayView:   View?                       = null
