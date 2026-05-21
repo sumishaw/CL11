@@ -325,11 +325,13 @@ class SpeechCaptureService : Service() {
     }
 
     private fun isTooSimilar(a: String, b: String): Boolean {
+        // 95% threshold — only block near-identical output (true duplicates)
+        // Previous 80% was blocking valid new content from overlapping chunks
         val wordsA = a.trim().split("\\s+".toRegex()).filter { it.length > 1 }.toSet()
         val wordsB = b.trim().split("\\s+".toRegex()).filter { it.length > 1 }.toSet()
         if (wordsA.isEmpty()) return false
         val overlap = wordsA.intersect(wordsB).size
-        return overlap.toDouble() / wordsA.size > 0.80
+        return overlap.toDouble() / wordsA.size > 0.95
     }
 
     private fun sendToWhisper(wavBytes: ByteArray, stampMs: Long) {
