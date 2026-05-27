@@ -335,7 +335,14 @@ class SpeechCaptureService : Service() {
             conn.outputStream.use { it.write(wavBytes) }
 
             val respCode = conn.responseCode
-            if (respCode == 503) { Log.d(TAG, "Server busy 503 — skip"); return }
+            if (respCode == 503) {
+                // Server busy — retry this chunk once after 500ms instead of dropping it
+                Log.d(TAG, "Server busy 503 — retrying in 500ms")
+                Thread.sleep(500)
+                conn.disconnect()
+                sendToWhisper(wavBytes, stampMs)  // retry once
+                return
+            }
             if (respCode != 200) { handleWhisperFailure("HTTP $respCode"); return }
 
             val body       = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
