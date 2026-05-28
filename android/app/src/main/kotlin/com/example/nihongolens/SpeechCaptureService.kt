@@ -57,10 +57,12 @@ class SpeechCaptureService : Service() {
         private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()   // 32 000
         private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                    // 64 000
 
-        private const val OVERLAP_SECS    = 0.3
-        private const val OVERLAP_SAMPLES = (SAMPLE_RATE * OVERLAP_SECS).toInt() // 4 800
-        private const val OVERLAP_BYTES   = OVERLAP_SAMPLES * 2                  // 9 600
-        private const val SEND_BYTES      = CHUNK_BYTES + OVERLAP_BYTES          // 73 600
+        // small model is accurate enough — 0.1s overlap is sufficient for boundary words
+        // Reducing from 0.3s cuts audio sent per chunk by ~10% → less CPU load
+        private const val OVERLAP_SECS    = 0.1
+        private const val OVERLAP_SAMPLES = (SAMPLE_RATE * OVERLAP_SECS).toInt() // 1 600
+        private const val OVERLAP_BYTES   = OVERLAP_SAMPLES * 2                  // 3 200
+        private const val SEND_BYTES      = CHUNK_BYTES + OVERLAP_BYTES          // 67 200
 
         private const val QUEUE_CAPACITY = 4
 
