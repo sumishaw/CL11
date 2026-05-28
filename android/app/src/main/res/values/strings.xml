@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">Caption Lens</string>
     <string name="accessibility_description">Captures internal video audio and translates to Hindi subtitles</string>
+    <string name="accessibility_service_description">Reads Live Captions text and translates to Hindi subtitles in real-time. No audio is recorded.</string>
 </resources>
