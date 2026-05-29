@@ -31,7 +31,14 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT = 2_000
         private const val READ_TIMEOUT    = 12_000
-        private const val DEBOUNCE_MS     = 2000L  // 2s lag — lets Live Captions finish correcting
+
+        // 500ms debounce — short enough to catch rapid dialogue,
+        // long enough for Live Captions to finish word-correction on each line
+        private const val DEBOUNCE_MS     = 500L
+
+        // Force-send after this long even if Live Captions keeps updating
+        // Prevents infinite deferral during fast continuous speech
+        private const val MAX_WAIT_MS     = 3_000L
 
         @Volatile var isRunning       = false
         @Volatile var lastCaptionText = ""
@@ -40,9 +47,11 @@ class LiveCaptionReader : AccessibilityService() {
 
     private val scope         = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var pendingJob:    Job? = null
+    private var forceJob:      Job? = null   // fires after MAX_WAIT_MS regardless of updates
     private var translateJob:  Job? = null
     private var lastSentText   = ""
     private var lastHindiOut   = ""
+    private var lastDetectedLang = ""        // track language switches
     private val translateQueue = LinkedBlockingQueue<String>(8)
 
     override fun onServiceConnected() {
@@ -72,6 +81,8 @@ class LiveCaptionReader : AccessibilityService() {
         lastHindiOut            = ""
         lastCaptionText         = ""
         lastTranslatedSentence  = ""
+        lastDetectedLang        = ""
+        sentenceBuffer.clear()
         SpeechCaptureService.latestHindi   = ""
         SpeechCaptureService.latestEnglish = ""
         Log.i(TAG, "LiveCaptionReader v6 connected")
@@ -96,6 +107,10 @@ class LiveCaptionReader : AccessibilityService() {
 
     private var lastTranslatedSentence = ""
 
+    // Rolling buffer of recent caption sentences for context
+    private val sentenceBuffer = ArrayDeque<String>()
+    private val BUFFER_MAX = 3  // keep last 3 sentences for context
+
     private fun readFromCaptionWindow(): String? {
         val allWindows = try { windows } catch (_: Exception) { return null }
         if (allWindows.isNullOrEmpty()) return null
@@ -115,18 +130,29 @@ class LiveCaptionReader : AccessibilityService() {
 
                 if (validTexts.isEmpty()) return null
 
-                // Get the full accumulated text from Live Captions window
+                // Take the longest text node — most complete Live Captions accumulation
                 val fullText = validTexts.maxByOrNull { it.length } ?: return null
 
-                // Split by sentence boundaries and take the LAST complete sentence
-                val lastSentence = extractLastSentence(fullText) ?: return null
+                // Extract all new complete sentences from the full text
+                val newSentences = extractNewSentences(fullText)
+                if (newSentences.isEmpty()) return null
 
-                // Only translate if it's new and long enough to be meaningful
-                if (lastSentence == lastTranslatedSentence) return null
-                if (lastSentence.length < 4) return null
+                // Add new sentences to buffer
+                for (s in newSentences) {
+                    if (s !in sentenceBuffer) {
+                        sentenceBuffer.addLast(s)
+                    }
+                }
+                while (sentenceBuffer.size > BUFFER_MAX) sentenceBuffer.removeFirst()
 
-                lastTranslatedSentence = lastSentence
-                return lastSentence
+                // Send joined context — CT2 translates short lines much better with context
+                // e.g. "Yeah." alone → empty; "I understand. Yeah. Good." → हाँ। ठीक है।
+                val contextText = sentenceBuffer.joinToString(" ").trim()
+                if (contextText == lastTranslatedSentence) return null
+                if (contextText.length < 3) return null
+
+                lastTranslatedSentence = contextText
+                return contextText
             } else {
                 root.recycle()
             }
@@ -134,23 +160,19 @@ class LiveCaptionReader : AccessibilityService() {
         return null
     }
 
-    private fun extractLastSentence(text: String): String? {
-        // Split on Japanese/English sentence endings
-        val sentences = text
-            .split(Regex("[。！？!?]+"))
+    private fun extractNewSentences(text: String): List<String> {
+        // Split on sentence boundaries (Japanese + English + common punctuation)
+        val raw = text.split(Regex("[。！？!?]+|(?<=[.])\\s+"))
             .map { it.trim() }
-            .filter { it.length >= 4 }
+            .filter { it.length >= 3 }
 
-        if (sentences.isEmpty()) {
-            // No sentence boundaries — return full text if reasonable length
-            return if (text.trim().length >= 4) text.trim() else null
+        if (raw.isEmpty()) {
+            return if (text.trim().length >= 3) listOf(text.trim()) else emptyList()
         }
 
-        // Return last complete sentence
-        return sentences.lastOrNull()
+        // Return only sentences not already in our buffer
+        return raw.filter { it !in sentenceBuffer }
     }
-
-    private fun findNewContent(previous: String, current: String): String = current
 
     private fun collectAllText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
         node ?: return
@@ -162,7 +184,7 @@ class LiveCaptionReader : AccessibilityService() {
     private fun isStaticUiLabel(text: String): Boolean {
         val lower = text.lowercase()
         // Drop Live Captions UI locale strings e.g. "English (United States)"
-        // These are always short and match the pattern: "Language (Region)"
+        // These always match the pattern: "Word (Word)" and are short
         if (text.matches(Regex("[A-Za-zÀ-ÿ ]+\\([A-Za-zÀ-ÿ ]+\\)")) && text.length < 60) return true
         if (lower.contains("united states") || lower.contains("united kingdom")) return true
         if (lower.contains("simplified") || lower.contains("traditional")) return true
@@ -172,34 +194,71 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun isValidCaption(text: String): Boolean {
-        if (text.length < 4 || text.length > 350) return false
+        if (text.length < 3 || text.length > 400) return false
         val letters = text.count { it.isLetter() }
-        if (letters < text.length * 0.4) return false
+        if (letters < text.length * 0.35) return false
         if (text.contains("http") || text.contains("www.")) return false
         if (text.contains("com.android") || text.contains("com.google")) return false
         // Reject locale strings like "English (United States)"
         if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
-        // Reject very short English fragments (single/double words) — UI noise
-        val isAllAscii = text.all { it.code < 128 }
-        if (isAllAscii && text.split(" ").size <= 2 && text.length < 15) return false
         return true
     }
 
     private fun scheduleTranslation(text: String) {
-        // Cancel previous timer — restart 2s countdown on every new word from Live Captions
-        // Timer only fires when Live Captions stops updating (sentence complete + corrected)
+        // Detect language switch — if script changes, clear dedup so first line
+        // of new language is never silently dropped
+        val scriptNow = detectScript(text)
+        if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
+            lastSentText           = ""
+            lastTranslatedSentence = ""
+            lastHindiOut           = ""
+            sentenceBuffer.clear()
+        }
+        lastDetectedLang = scriptNow
+
+        // Debounce: cancel existing 500ms timer, restart it
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
-            // Read the caption window AGAIN after 2s — get the fully corrected text
-            val finalText = readFromCaptionWindow() ?: lastCaptionText
-            if (finalText.isNotBlank() && finalText != lastSentText) {
-                lastSentText = finalText
-                if (translateQueue.size >= 8) translateQueue.poll()
-                translateQueue.offer(finalText)
+            enqueueForTranslation(readFromCaptionWindow() ?: lastCaptionText)
+        }
+
+        // Force-send: if no force job is running, start one for MAX_WAIT_MS
+        // This fires even if Live Captions keeps updating continuously,
+        // so fast dialogue always produces output every ~3s at minimum
+        if (forceJob == null || forceJob?.isActive == false) {
+            forceJob = scope.launch {
+                delay(MAX_WAIT_MS)
+                pendingJob?.cancel()   // cancel the debounce — we're sending now
+                enqueueForTranslation(readFromCaptionWindow() ?: lastCaptionText)
             }
         }
     }
+
+    private fun enqueueForTranslation(text: String) {
+        forceJob?.cancel()
+        forceJob = null
+        if (text.isBlank() || text == lastSentText) return
+        lastSentText = text
+        if (translateQueue.size >= 8) translateQueue.poll()
+        translateQueue.offer(text)
+    }
+
+    /** Coarse script detection for language-switch tracking only. */
+    private fun detectScript(text: String): String {
+        for (c in text) {
+            val cp = ord(c)
+            if (cp in 0x3040..0x30FF) return "ja"
+            if (cp in 0x4E00..0x9FFF) return "zh"
+            if (cp in 0xAC00..0xD7AF) return "ko"
+            if (cp in 0x0600..0x06FF) return "ar"
+            if (cp in 0x0400..0x04FF) return "ru"
+            if (cp in 0x0900..0x097F) return "hi"
+        }
+        return "latin"
+    }
+
+    private fun ord(c: Char) = c.code
 
     private fun startTranslateWorker() {
         translateJob = scope.launch {
@@ -210,8 +269,9 @@ class LiveCaptionReader : AccessibilityService() {
                 } ?: continue
 
                 val hindi = translate(text) ?: continue
-                if (hindi.isBlank() || hindi == lastHindiOut) continue
-                lastHindiOut = hindi
+                if (hindi.isBlank()) continue
+                // Don't block on lastHindiOut equality — short repeated lines
+                // (e.g. "हाँ।" "ठीक है।") are valid subtitles in rapid dialogue
 
                 Log.i(TAG, "✓ ${text.take(40)} → ${hindi.take(40)}")
                 SpeechCaptureService.latestHindi   = hindi
@@ -251,7 +311,8 @@ class LiveCaptionReader : AccessibilityService() {
 
     override fun onDestroy() {
         isRunning = false; instance = null
-        pendingJob?.cancel(); translateJob?.cancel(); scope.cancel()
+        pendingJob?.cancel(); forceJob?.cancel()
+        translateJob?.cancel(); scope.cancel()
         super.onDestroy()
     }
 }
