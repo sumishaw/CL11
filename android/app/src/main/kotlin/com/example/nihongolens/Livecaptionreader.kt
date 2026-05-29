@@ -82,6 +82,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastDetectedLang        = ""
         lastRawCaption          = ""
         lastSentSuffix          = ""
+        captionWasVisible       = false
         SpeechCaptureService.latestHindi   = ""
         SpeechCaptureService.latestEnglish = ""
         Log.i(TAG, "LiveCaptionReader v6 connected")
@@ -106,73 +107,79 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastTranslatedSentence = ""
 
     // The last raw full-text we saw from the Live Captions window
-    // Used to diff against the new text and extract only the NEW suffix
-    private var lastRawCaption = ""
-    // Sliding window of last ~200 chars already sent — prevents resending
-    // when Live Captions briefly scrolls back
-    private var lastSentSuffix = ""
+    private var lastRawCaption    = ""
+    // Last text we sent for translation
+    private var lastSentSuffix    = ""
+    // Whether the Live Captions window was visible on the previous event
+    // When it goes invisible (silence) → visible (new speech), we reset state
+    private var captionWasVisible = false
 
     private fun readFromCaptionWindow(): String? {
         val allWindows = try { windows } catch (_: Exception) { return null }
-        if (allWindows.isNullOrEmpty()) return null
 
-        for (window in allWindows) {
-            val root = try { window.root } catch (_: Exception) { continue } ?: continue
-            val windowPkg = root.packageName?.toString() ?: ""
-
-            if (windowPkg in LIVE_CAPTION_PACKAGES) {
-                val textNodes = mutableListOf<String>()
-                collectAllText(root, textNodes)
-                root.recycle()
-
-                val validTexts = textNodes
-                    .filter { isValidCaption(it) }
-                    .filter { !isStaticUiLabel(it) }
-
-                if (validTexts.isEmpty()) return null
-
-                // Live Captions accumulates into one long node — take the longest
-                val fullText = validTexts.maxByOrNull { it.length }?.trim() ?: return null
-
-                // ── Detect Live Captions reset ──────────────────────────────
-                // Live Captions clears itself after silence, starting fresh.
-                // Detect this: new text is much shorter AND doesn't end with
-                // anything from the old text → full reset, clear our state.
-                if (lastRawCaption.isNotEmpty() &&
-                    fullText.length < lastRawCaption.length / 2 &&
-                    !lastRawCaption.endsWith(fullText.takeLast(20).trim())) {
-                    lastRawCaption  = ""
-                    lastSentSuffix  = ""
-                    lastTranslatedSentence = ""
+        // Scan for the Live Captions window
+        var captionRoot: android.view.accessibility.AccessibilityNodeInfo? = null
+        if (!allWindows.isNullOrEmpty()) {
+            for (window in allWindows) {
+                val root = try { window.root } catch (_: Exception) { continue } ?: continue
+                if (root.packageName?.toString() in LIVE_CAPTION_PACKAGES) {
+                    captionRoot = root
+                    break
                 }
-
-                // No change at all
-                if (fullText == lastRawCaption) return null
-
-                // ── Extract only the NEW suffix ─────────────────────────────
-                // Live Captions appends — so new content is always a suffix.
-                // Find the longest common prefix between old and new text,
-                // then everything after that is genuinely new.
-                val newPart = extractNewSuffix(lastRawCaption, fullText)
-                lastRawCaption = fullText
-
-                if (newPart.isBlank() || newPart.length < 3) return null
-
-                // ── Extract complete sentences from the new suffix ──────────
-                // The new suffix may be mid-sentence (word correction still ongoing).
-                // We send the last complete sentence + the incomplete tail for context.
-                val toSend = buildSendText(newPart, fullText)
-                if (toSend.isNullOrBlank()) return null
-                if (toSend == lastSentSuffix) return null
-
-                lastSentSuffix = toSend
-                return toSend
-
-            } else {
                 root.recycle()
             }
         }
-        return null
+
+        // Live Captions window not visible — overlay disappeared (silence)
+        if (captionRoot == null) {
+            if (captionWasVisible) {
+                // Window just disappeared → reset ALL state so next session starts clean
+                captionWasVisible  = false
+                lastRawCaption     = ""
+                lastSentSuffix     = ""
+                lastTranslatedSentence = ""
+                Log.d(TAG, "Live Captions overlay gone — state reset for next session")
+            }
+            return null
+        }
+
+        // Window is visible
+        val textNodes = mutableListOf<String>()
+        collectAllText(captionRoot, textNodes)
+        captionRoot.recycle()
+
+        val validTexts = textNodes
+            .filter { isValidCaption(it) }
+            .filter { !isStaticUiLabel(it) }
+
+        if (validTexts.isEmpty()) return null
+
+        val fullText = validTexts.maxByOrNull { it.length }?.trim() ?: return null
+
+        // Fresh session: window reappeared after silence
+        if (!captionWasVisible) {
+            captionWasVisible  = true
+            lastRawCaption     = ""
+            lastSentSuffix     = ""
+            lastTranslatedSentence = ""
+            Log.d(TAG, "Live Captions overlay appeared — fresh session")
+        }
+
+        // No change since last event
+        if (fullText == lastRawCaption) return null
+
+        // Extract only the new suffix (Live Captions only appends within a session)
+        val newPart = extractNewSuffix(lastRawCaption, fullText)
+        lastRawCaption = fullText
+
+        if (newPart.isBlank() || newPart.length < 3) return null
+
+        // Build send text: last complete sentence + new fragment for CT2 context
+        val toSend = buildSendText(newPart, fullText) ?: return null
+        if (toSend == lastSentSuffix) return null
+
+        lastSentSuffix = toSend
+        return toSend
     }
 
     /**
@@ -277,6 +284,7 @@ class LiveCaptionReader : AccessibilityService() {
             lastHindiOut           = ""
             lastRawCaption         = ""
             lastSentSuffix         = ""
+            captionWasVisible      = false
         }
         lastDetectedLang = scriptNow
 
