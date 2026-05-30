@@ -63,7 +63,6 @@ class OverlayService : Service() {
 
     // Current lines: index 0 = older (top), index 1 = newer (bottom)
     private val lines = mutableListOf<String>()
-    private var lastHindi        = ""
     private var silenceRunnable: Runnable? = null
 
     private fun dp(v: Int) = TypedValue.applyDimension(
@@ -98,7 +97,7 @@ class OverlayService : Service() {
         lines.clear()
         displayQueue.clear()
         flipScheduled = false
-        lastHindi     = ""
+        cancelStaleLine()
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
@@ -110,44 +109,77 @@ class OverlayService : Service() {
 
     private fun onNewText(original: String, hindi: String) {
         if (hindi.isBlank()) return
-        if (hindi == lastHindi) return
-        lastHindi = hindi
+        // No lastHindi dedup — every translation is always fresh, never cached
 
         val incoming = splitHindi(hindi.trim())
         for (sentence in incoming) {
             if (sentence.isNotBlank()) displayQueue.addLast(sentence)
         }
 
-        // Kick the display loop whenever new content arrives
         advanceDisplay()
         rescheduleSilence()
     }
 
-    // Called whenever new sentences arrive OR after each line is shown.
-    // If lines < 2: fill from queue immediately.
-    // If lines == 2: schedule a page-flip after MIN_LINE_MS, then fill again.
-    private val MIN_LINE_MS = 800L   // minimum time each line stays visible
-    private var flipScheduled = false
+    // MIN_LINE_MS: minimum time a 2-line block stays visible before page-flip.
+    // 2500ms gives enough time to read both lines comfortably.
+    // STALE_LINE_MS: if only 1 line is showing and nothing new arrives,
+    // clear it after this delay so it doesn't stick on screen forever.
+    private val MIN_LINE_MS   = 2_500L
+    private val STALE_LINE_MS = 5_000L
+    private var flipScheduled  = false
+    private var staleRunnable: Runnable? = null
 
     private fun advanceDisplay() {
-        // Fill empty slots immediately
+        cancelStaleLine()
+
+        // Fill empty slots from queue immediately
         while (lines.size < MAX_LINES && displayQueue.isNotEmpty()) {
             lines.add(displayQueue.removeFirst())
             renderLines(animate = true)
         }
 
-        // If now full and more waiting, schedule a page-flip
-        if (lines.size >= MAX_LINES && displayQueue.isNotEmpty() && !flipScheduled) {
-            flipScheduled = true
-            mainHandler.postDelayed({
-                flipScheduled = false
-                if (!running) return@postDelayed
-                clearWithFade {
-                    lines.clear()
-                    advanceDisplay()   // recurse: fill new block from queue
-                }
-            }, MIN_LINE_MS)
+        when {
+            // Block full AND more queued → schedule page-flip after MIN_LINE_MS
+            lines.size >= MAX_LINES && displayQueue.isNotEmpty() && !flipScheduled -> {
+                flipScheduled = true
+                mainHandler.postDelayed({
+                    flipScheduled = false
+                    if (!running) return@postDelayed
+                    clearWithFade {
+                        lines.clear()
+                        advanceDisplay()
+                    }
+                }, MIN_LINE_MS)
+            }
+
+            // Only 1 line showing and queue is empty → schedule stale clear
+            // so a lone subtitle doesn't stick on screen indefinitely
+            lines.size in 1 until MAX_LINES && displayQueue.isEmpty() -> {
+                scheduleStaleLineClear()
+            }
+
+            // Block full, nothing more queued → hold until new text arrives
+            // (handled by next call to advanceDisplay from onNewText)
         }
+    }
+
+    private fun scheduleStaleLineClear() {
+        staleRunnable = Runnable {
+            if (!running) return@Runnable
+            if (displayQueue.isEmpty()) {
+                // Nothing arrived — clear the stale line
+                clearWithFade { lines.clear() }
+            } else {
+                // New content arrived while waiting — advance normally
+                advanceDisplay()
+            }
+        }
+        mainHandler.postDelayed(staleRunnable!!, STALE_LINE_MS)
+    }
+
+    private fun cancelStaleLine() {
+        staleRunnable?.let { mainHandler.removeCallbacks(it) }
+        staleRunnable = null
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -222,11 +254,11 @@ class OverlayService : Service() {
     private fun rescheduleSilence() {
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable = Runnable {
+            cancelStaleLine()
             clearWithFade {
                 lines.clear()
                 displayQueue.clear()
                 flipScheduled = false
-                lastHindi = ""
             }
         }
         mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
