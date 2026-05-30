@@ -1,7 +1,6 @@
 package com.example.nihongolens
 
 import android.content.Context
-import android.os.Environment
 import java.io.File
 import java.io.FileWriter
 import java.io.PrintWriter
@@ -42,11 +41,9 @@ object CaptionLogger {
         if (running) return
         running = true
 
-        // Try candidate paths from most to least accessible
-        val candidates = listOfNotNull(
-            File(Environment.getExternalStorageDirectory(), "caption_lens_log.txt"),
-            context.getExternalFilesDir(null)?.let { File(it, "caption_lens_log.txt") },
-            File(context.filesDir, "caption_lens_log.txt"),
+        // Fixed log path — always writes here
+        val candidates = listOf(
+            File("/storage/emulated/0/Captionlogger/caption_lens_log.txt"),
         )
 
         for (candidate in candidates) {
