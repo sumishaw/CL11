@@ -403,20 +403,22 @@ class LiveCaptionReader : AccessibilityService() {
 
     private fun isStaticUiLabel(text: String): Boolean {
         val lower = text.lowercase()
-        if (text.matches(Regex("[A-Za-zÀ-ÿ ]+\\([A-Za-zÀ-ÿ ]+\\)")) && text.length < 60) return true
+        // Only drop confirmed Live Captions UI strings — locale selectors
         if (lower.contains("united states") || lower.contains("united kingdom")) return true
         if (lower.contains("simplified") || lower.contains("traditional")) return true
-        if (!text.contains(" ") && text.length < 15) return true
+        // Known LC UI button labels
+        if (text == "Hide" || text == "Settings" || text == "Feedback") return true
         return false
     }
 
     private fun isValidCaption(text: String): Boolean {
-        if (text.length < 3 || text.length > 400) return false
+        if (text.length < 2 || text.length > 500) return false
+        // Must contain at least 2 letters
         val letters = text.count { it.isLetter() }
-        if (letters < text.length * 0.35) return false
-        if (text.contains("http") || text.contains("www.")) return false
+        if (letters < 2) return false
+        // Drop Android package names
         if (text.contains("com.android") || text.contains("com.google")) return false
-        if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
+        if (text.contains("http") || text.contains("www.")) return false
         return true
     }
 
