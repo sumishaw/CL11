@@ -268,6 +268,12 @@ class LiveCaptionReader : AccessibilityService() {
 
     // ── Scheduling ────────────────────────────────────────────────────────────
 
+    // Track the last text that was actually sent to server (normalized)
+    // Use normalized form (trimmed, collapsed spaces) to catch near-duplicates
+    private var lastEnqueuedNorm = ""
+
+    private fun normalize(text: String) = text.trim().replace(Regex("\\s+"), " ")
+
     private fun scheduleTranslation(sendText: String) {
         val scriptNow = detectScript(sendText)
         if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
@@ -277,24 +283,26 @@ class LiveCaptionReader : AccessibilityService() {
             lastHindiOut           = ""
             lastRawCaption         = ""
             lastSentText2          = ""
+            lastEnqueuedNorm       = ""
             translateQueue.clear()
         }
         lastDetectedLang = scriptNow
 
+        // Debounce: wait 500ms for LC to finish word-correction on current line
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
             val toSend = lastSentText2.ifBlank { sendText }
-            CaptionLogger.log(TAG, "Debounce fired — enqueue '${toSend.take(60)}'")
             enqueueForTranslation(toSend)
         }
 
+        // Force-send: only start if no force job running AND debounce not about to fire
+        // This prevents force+debounce both firing on the same content
         if (forceJob == null || forceJob?.isActive == false) {
             forceJob = scope.launch {
                 delay(MAX_WAIT_MS)
-                pendingJob?.cancel()
+                pendingJob?.cancel()  // cancel debounce — force takes over
                 val toSend = lastSentText2.ifBlank { sendText }
-                CaptionLogger.log(TAG, "ForceJob fired — enqueue '${toSend.take(60)}'")
                 enqueueForTranslation(toSend)
             }
         }
@@ -303,13 +311,30 @@ class LiveCaptionReader : AccessibilityService() {
     private fun enqueueForTranslation(text: String) {
         forceJob?.cancel()
         forceJob = null
-        if (text.isBlank()) {
-            CaptionLogger.log(TAG, "enqueue SKIP: blank"); return
+        if (text.isBlank()) return
+
+        // Normalize before dedup check — catches near-duplicates where only
+        // trailing whitespace or punctuation differs
+        val norm = normalize(text)
+        if (norm == lastEnqueuedNorm) {
+            CaptionLogger.log(TAG, "enqueue SKIP duplicate: '${text.take(50)}'")
+            return
         }
-        if (text == lastSentText) {
-            CaptionLogger.log(TAG, "enqueue SKIP: duplicate '${text.take(40)}'"); return
+
+        // Also check if this is just a short suffix of what we already sent
+        // (LC appended 1-2 words — not enough new content to re-translate)
+        if (norm.length > 20 && lastEnqueuedNorm.isNotEmpty() &&
+            norm.startsWith(lastEnqueuedNorm.take(lastEnqueuedNorm.length.coerceAtMost(norm.length - 8)))) {
+            val newChars = norm.length - lastEnqueuedNorm.length
+            if (newChars in 1..15) {
+                // Only 1-15 new chars — not worth re-translating entire sentence
+                CaptionLogger.log(TAG, "enqueue SKIP minor append (+${newChars}ch): '${text.takeLast(20)}'")
+                return
+            }
         }
-        lastSentText = text
+
+        lastEnqueuedNorm = norm
+        lastSentText     = text
         translateQueue.offer(text)
         enqueued.incrementAndGet()
         CaptionLogger.log(TAG, "ENQUEUED #${enqueued.get()} qSize=${translateQueue.size} '${text.take(60)}'")
@@ -399,6 +424,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastRawCaption          = ""
         lastSentText2           = ""
         captionWasVisible       = false
+        lastEnqueuedNorm        = ""
         SpeechCaptureService.latestHindi   = ""
         SpeechCaptureService.latestEnglish = ""
     }
