@@ -345,6 +345,8 @@ class LiveCaptionReader : AccessibilityService() {
                 if (hindi.isNullOrBlank()) {
                     translateErrors.incrementAndGet()
                     CaptionLogger.log(TAG, "NULL/BLANK in ${ms}ms for '${text.take(40)}'")
+                    // Clear dedup so this text can be retried if LC shows it again
+                    if (lastEnqueuedNorm == normalize(text)) lastEnqueuedNorm = ""
                     continue
                 }
 
