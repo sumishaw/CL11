@@ -183,7 +183,7 @@ class LiveCaptionReader : AccessibilityService() {
             if (lcVisible) {
                 lcVisible = false; lastRaw = ""; lastFull = ""
                 lastNorm = ""; lastSentText = ""
-                lastHindiOut = ""; lastHindiTime = 0L
+                lastHindiOut = ""; lastHindiTime = 0L; lastEnqueuedFull = ""
                 val dropped = queue.size
                 queue.clear()
                 expectedSeq = seqCounter.get() + 1
@@ -258,10 +258,10 @@ class LiveCaptionReader : AccessibilityService() {
         }
     }
 
-    // Track last successful translation output to block duplicate results
+    private var lastEnqueuedFull = ""  // full text that was last enqueued
     private var lastHindiOut     = ""
     private var lastHindiTime    = 0L
-    private val HINDI_DEDUP_MS   = 3_000L  // don't show same Hindi within 3s
+    private val HINDI_DEDUP_MS   = 8_000L  // don't show same Hindi within 8s
 
     private fun enqueue(text: String) {
         forceJob?.cancel(); forceJob = null
@@ -269,21 +269,31 @@ class LiveCaptionReader : AccessibilityService() {
 
         val n = norm(text)
 
-        // Tail-based dedup: compare last 80 chars
+        // Primary dedup: exact normalized match
+        if (n == lastNorm) return
+
+        // Tail dedup: last 80 chars identical → same content, just more accumulated prefix
         val tail     = if (n.length > 80) n.takeLast(80) else n
         val lastTail = if (lastNorm.length > 80) lastNorm.takeLast(80) else lastNorm
         if (tail == lastTail) return
 
-        // Skip minor extensions (< 8 new chars)
-        if (lastNorm.isNotEmpty() && n.length > lastNorm.length) {
-            val added = n.length - lastNorm.length
-            if (added < 8 && n.startsWith(lastNorm.take(lastNorm.length.coerceAtMost(n.length - 4))))
+        // Content growth check: if this is just the accumulated LC window growing
+        // by a few chars, don't re-translate. Require at least 15 new meaningful chars
+        // OR a non-append (new sentence / scene change)
+        val isAppend = n.length > lastEnqueuedFull.length &&
+            n.startsWith(lastEnqueuedFull.take(lastEnqueuedFull.length.coerceAtMost(n.length - 10)))
+        if (isAppend) {
+            val newChars = n.length - lastEnqueuedFull.length
+            if (newChars < 15) {
+                CaptionLogger.log(TAG, "SKIP minor grow +${newChars}ch")
                 return
+            }
         }
 
-        lastNorm     = n
-        lastSentText = text
-        val seq      = seqCounter.incrementAndGet()
+        lastNorm         = n
+        lastSentText     = text
+        lastEnqueuedFull = n
+        val seq          = seqCounter.incrementAndGet()
 
         while (queue.size >= QUEUE_CAP) queue.poll()
         queue.offer(Pair(seq, text))
@@ -371,7 +381,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastNorm = ""; lastSentText = ""; confirmedLang = ""
         pendingLang = ""; pendingCount = 0
         lastRaw = ""; lastFull = ""; lcVisible = false; expectedSeq = 0L
-        lastHindiOut = ""; lastHindiTime = 0L
+        lastHindiOut = ""; lastHindiTime = 0L; lastEnqueuedFull = ""
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
         SpeechCaptureService.latestOriginal = ""
@@ -406,15 +416,24 @@ class LiveCaptionReader : AccessibilityService() {
     private fun detectScript(text: String): String {
         var ja = 0; var zh = 0; var ko = 0; var ar = 0; var ru = 0; var hi = 0
         for (c in text) when (c.code) {
-            in 0x3040..0x30FF -> ja++
-            in 0x4E00..0x9FFF -> zh++
-            in 0xAC00..0xD7AF -> ko++
-            in 0x0600..0x06FF -> ar++
-            in 0x0400..0x04FF -> ru++
-            in 0x0900..0x097F -> hi++
+            in 0x3040..0x30FF -> ja++   // Hiragana + Katakana
+            in 0x4E00..0x9FFF -> zh++   // CJK Unified
+            in 0xAC00..0xD7AF -> ko++   // Hangul
+            in 0x0600..0x06FF -> ar++   // Arabic
+            in 0x0400..0x04FF -> ru++   // Cyrillic
+            in 0x0900..0x097F -> hi++   // Devanagari
         }
-        val max = maxOf(ja, zh, ko, ar, ru, hi)
-        if (max == 0) return if (text.any { it.isLetter() && it.code in 0x00C0..0x024F }) "latin_foreign" else "latin_en"
-        return when (max) { ja -> "ja"; ko -> "ko"; hi -> "hi"; ar -> "ar"; ru -> "ru"; else -> "zh" }
+        // If ANY CJK/non-Latin script characters present, use that script
+        // Never let English words in a Japanese sentence flip detection to Latin
+        val nonLatin = maxOf(ja, zh, ko, ar, ru, hi)
+        if (nonLatin > 0) {
+            return when (nonLatin) {
+                ja -> "ja"; ko -> "ko"; hi -> "hi"
+                ar -> "ar"; ru -> "ru"; else -> "zh"
+            }
+        }
+        // Pure Latin — check for accented chars (European languages)
+        return if (text.any { it.isLetter() && it.code in 0x00C0..0x024F })
+            "latin_foreign" else "latin_en"
     }
 }
