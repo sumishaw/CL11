@@ -30,7 +30,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _ch = MethodChannel('overlay_channel');
 
   // State
@@ -40,6 +40,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   bool    hasOverlay       = false;
   bool    hasAccessibility = false;
   String  targetLang       = 'hindi';
+  double  subtitleSpeed    = 3.5;   // seconds — default hold time
   String  statusMsg        = '';
   int     translationCount = 0;
   bool    _pulse           = false;
@@ -50,18 +51,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   ModelState  modelState    = ModelState.checking;
   String      modelErrorMsg = '';
 
+  // Live Captions mode is now the primary mode
   CaptionMode captionMode = CaptionMode.liveCaptions;
-
-  // Log tab state
-  late TabController _tabController;
-  String  _logText      = 'Tap Refresh to load logs.';
-  bool    _logLoading   = false;
-  final   ScrollController _logScroll = ScrollController();
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
     WidgetsBinding.instance.addObserver(this);
 
     _ch.setMethodCallHandler((call) async {
@@ -218,10 +213,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     if (mounted) setState(() => targetLang = lang);
   }
 
+  Future<void> _setSubtitleSpeed(double seconds) async {
+    await _ch.invokeMethod('setSubtitleSpeed', {'seconds': seconds});
+    if (mounted) setState(() => subtitleSpeed = seconds);
+  }
+
   @override
   void dispose() {
-    _tabController.dispose();
-    _logScroll.dispose();
     _pulseTimer?.cancel();
     _pollTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -234,38 +232,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        toolbarHeight: 0,
-        bottom: TabBar(
-          controller: _tabController,
-          indicatorColor: const Color(0xFFFF3B3B),
-          labelColor: Colors.white,
-          unselectedLabelColor: Colors.white38,
-          tabs: const [
-            Tab(icon: Icon(Icons.subtitles), text: 'Caption Lens'),
-            Tab(icon: Icon(Icons.article_outlined), text: 'Logs'),
-          ],
-        ),
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          _buildMainTab(),
-          _buildLogTab(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMainTab() {
-    return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
               _buildHeader(),
               const SizedBox(height: 16),
               _buildInfoBanner(),
@@ -281,6 +253,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
               _buildLanguageChips(),
               const SizedBox(height: 16),
               _buildLangSelector(),
+              _buildSubtitleSpeedSlider(),
               const SizedBox(height: 16),
               if (originalText.isNotEmpty) ...[
                 _buildDetectedText(),
@@ -308,99 +281,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
             ],
           ),
         ),
-      );
-  }
-
-  // ── Log tab ───────────────────────────────────────────────────────────────
-
-  Future<void> _refreshLogs() async {
-    if (_logLoading) return;
-    setState(() => _logLoading = true);
-    try {
-      final logs = await _ch.invokeMethod<String>('getLogs') ?? 'No logs yet.';
-      setState(() => _logText = logs.isEmpty ? 'No logs yet.' : logs);
-      // Scroll to bottom after render
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_logScroll.hasClients)
-          _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
-      });
-    } catch (e) {
-      setState(() => _logText = 'Error fetching logs: $e');
-    } finally {
-      setState(() => _logLoading = false);
-    }
-  }
-
-  Future<void> _clearLogs() async {
-    await _ch.invokeMethod('clearLogs');
-    setState(() => _logText = 'Logs cleared.');
-  }
-
-  Widget _buildLogTab() {
-    return SafeArea(
-      child: Column(
-        children: [
-          // Toolbar
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Row(
-              children: [
-                const Text('Diagnostic Logs',
-                    style: TextStyle(color: Colors.white, fontSize: 15,
-                        fontWeight: FontWeight.bold)),
-                const Spacer(),
-                if (_logLoading)
-                  const SizedBox(width: 20, height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2,
-                          color: Color(0xFFFF3B3B)))
-                else
-                  IconButton(
-                    icon: const Icon(Icons.refresh, color: Color(0xFFFF3B3B)),
-                    tooltip: 'Refresh',
-                    onPressed: _refreshLogs,
-                  ),
-                IconButton(
-                  icon: const Icon(Icons.delete_outline, color: Colors.white38),
-                  tooltip: 'Clear',
-                  onPressed: _clearLogs,
-                ),
-              ],
-            ),
-          ),
-          const Divider(color: Colors.white12, height: 1),
-          // Log content
-          Expanded(
-            child: _logText.isEmpty
-                ? const Center(child: Text('No logs yet — tap Refresh',
-                    style: TextStyle(color: Colors.white38)))
-                : Scrollbar(
-                    controller: _logScroll,
-                    thumbVisibility: true,
-                    child: SingleChildScrollView(
-                      controller: _logScroll,
-                      padding: const EdgeInsets.all(12),
-                      child: SelectableText(
-                        _logText,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 11,
-                          fontFamily: 'monospace',
-                          height: 1.5,
-                        ),
-                      ),
-                    ),
-                  ),
-          ),
-          // Bottom hint
-          Padding(
-            padding: const EdgeInsets.all(8),
-            child: Text(
-              'Long-press text to copy • Tap Refresh to update',
-              style: const TextStyle(color: Colors.white24, fontSize: 10),
-              textAlign: TextAlign.center,
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -412,7 +292,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: isRunning
-            ? (_pulse ? Colors.red : Colors.red.withAlpha(128))
+            ? (_pulse ? Colors.red : Colors.red.withOpacity(0.5))
             : Colors.white12,
       ),
       child: const Icon(Icons.subtitles, color: Colors.white, size: 20),
@@ -444,9 +324,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.blue.withAlpha(20),
+        color: Colors.blue.withOpacity(0.08),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.blue.withAlpha(51)),
+        border: Border.all(color: Colors.blue.withOpacity(0.2)),
       ),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Icon(Icons.info_outline, color: Colors.blue, size: 16),
@@ -479,8 +359,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.notReady:
         return _cardShell(
           icon: Icons.cloud_off, iconColor: Colors.orangeAccent,
-          borderColor: Colors.orange.withAlpha(102),
-          bgColor: Colors.orange.withAlpha(15),
+          borderColor: Colors.orange.withOpacity(0.4),
+          bgColor: Colors.orange.withOpacity(0.06),
           title: 'Translation Server Not Running',
           subtitle: 'Run in Termux:\npython3 whisper_server.py',
           trailing: ElevatedButton(
@@ -496,8 +376,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.ready:
         return _cardShell(
           icon: Icons.check_circle, iconColor: Colors.greenAccent,
-          borderColor: Colors.greenAccent.withAlpha(77),
-          bgColor: Colors.green.withAlpha(15),
+          borderColor: Colors.greenAccent.withOpacity(0.3),
+          bgColor: Colors.green.withOpacity(0.06),
           title: 'Translation Server Ready',
           subtitle: 'CT2 opus-mt-en-hi · Hindi output · No censoring',
           trailing: const Icon(Icons.check, color: Colors.greenAccent, size: 20),
@@ -505,8 +385,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.error:
         return _cardShell(
           icon: Icons.error_outline, iconColor: Colors.redAccent,
-          borderColor: Colors.red.withAlpha(102),
-          bgColor: Colors.red.withAlpha(15),
+          borderColor: Colors.red.withOpacity(0.4),
+          bgColor: Colors.red.withOpacity(0.06),
           title: 'Translation Server Unreachable',
           subtitle: modelErrorMsg.isNotEmpty ? modelErrorMsg : 'Start whisper_server.py then tap RETRY',
           trailing: ElevatedButton(
@@ -561,7 +441,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     decoration: BoxDecoration(
       color: const Color(0xFF111111),
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: granted ? Colors.greenAccent.withAlpha(77) : Colors.white12),
+      border: Border.all(color: granted ? Colors.greenAccent.withOpacity(0.3) : Colors.white12),
     ),
     child: Row(children: [
       Icon(icon, color: iconColor, size: 20),
@@ -622,7 +502,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
           duration: const Duration(milliseconds: 180),
           padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
           decoration: BoxDecoration(
-            color: sel ? const Color(0x26FF3B3B) : const Color(0xFF1E1E1E),
+            color: sel ? const Color(0xFFFF3B3B).withOpacity(0.15) : const Color(0xFF1E1E1E),
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: sel ? const Color(0xFFFF3B3B) : Colors.white12),
           ),
@@ -634,7 +514,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
               fontSize: 12, fontWeight: sel ? FontWeight.bold : FontWeight.normal,
             )),
             Text(sublabel, style: TextStyle(
-              color: sel ? Colors.redAccent.withAlpha(179) : Colors.white24,
+              color: sel ? Colors.redAccent.withOpacity(0.7) : Colors.white24,
               fontSize: 10,
             )),
           ]),
@@ -648,7 +528,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     decoration: BoxDecoration(
       color: const Color(0xFF0a1628),
       borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: Colors.blue.withAlpha(51)),
+      border: Border.all(color: Colors.blue.withOpacity(0.2)),
     ),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Detects & Translates',
@@ -682,6 +562,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
         const SizedBox(width: 10),
         _langBtn('🇮🇳 Hindi', 'hindi'),
       ]),
+    ],
+  );
+
+  Widget _buildSubtitleSpeedSlider() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const SizedBox(height: 16),
+      Row(children: [
+        const Text('Subtitle display time',
+            style: TextStyle(color: Colors.white54, fontSize: 12,
+                fontWeight: FontWeight.bold)),
+        const Spacer(),
+        Text('${subtitleSpeed.toStringAsFixed(1)}s',
+            style: const TextStyle(color: Color(0xFFFF3B3B),
+                fontSize: 13, fontWeight: FontWeight.bold)),
+      ]),
+      SliderTheme(
+        data: SliderTheme.of(context).copyWith(
+          activeTrackColor:   const Color(0xFFFF3B3B),
+          inactiveTrackColor: Colors.white12,
+          thumbColor:         const Color(0xFFFF3B3B),
+          overlayColor:       const Color(0x22FF3B3B),
+          trackHeight:        3,
+        ),
+        child: Slider(
+          value:    subtitleSpeed,
+          min:      1.5,
+          max:      10.0,
+          divisions: 17,   // 0.5s steps: 1.5, 2.0, 2.5 ... 10.0
+          onChanged: (v) => _setSubtitleSpeed(double.parse(v.toStringAsFixed(1))),
+        ),
+      ),
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: const [
+          Text('Fast', style: TextStyle(color: Colors.white24, fontSize: 10)),
+          Text('Slow', style: TextStyle(color: Colors.white24, fontSize: 10)),
+        ],
+      ),
     ],
   );
 
@@ -719,9 +638,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
           width: double.infinity,
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: Colors.green.withAlpha(20),
+            color: Colors.green.withOpacity(0.08),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.greenAccent.withAlpha(77)),
+            border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
           ),
           child: Text(displayText,
               style: const TextStyle(
@@ -735,9 +654,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   Widget _buildStatusBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
-      color: Colors.orange.withAlpha(26),
+      color: Colors.orange.withOpacity(0.1),
       borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: Colors.orange.withAlpha(77)),
+      border: Border.all(color: Colors.orange.withOpacity(0.3)),
     ),
     child: Row(children: [
       const Icon(Icons.info_outline, color: Colors.orange, size: 16),
@@ -782,7 +701,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   Widget _chip(String label) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
     decoration: BoxDecoration(
-      color: Colors.white.withAlpha(15),
+      color: Colors.white.withOpacity(0.06),
       borderRadius: BorderRadius.circular(20),
       border: Border.all(color: Colors.white12),
     ),
