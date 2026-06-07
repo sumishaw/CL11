@@ -30,23 +30,25 @@ class OverlayService : Service() {
         @Volatile var latestHindi    = ""
         @Volatile private var pushCallback:  ((String, String) -> Unit)? = null
         @Volatile private var clearCallback: (() -> Unit)?               = null
+        @Volatile private var holdCallback:  ((Long) -> Unit)?           = null
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
             pushCallback?.invoke(original, hindi)
         }
         fun clearQueue() { clearCallback?.invoke() }
+        fun setHoldMs(ms: Long) { holdCallback?.invoke(ms) }
     }
+
+    // Timing — holdMsVar is user-controllable via Settings slider
+    private var holdMsVar        = 3_500L
 
     // ── Timing ────────────────────────────────────────────────────────────────
     // Words appear instantly (0ms gap) — fills 2 lines fast matching speech pace
     // When 2 lines full: hold HOLD_MS so user can read, then clear and continue
     // LINE_CHARS: approximate chars that fit 2 lines at 20sp on a tablet
-    private val WORD_INTERVAL_MS = 0L      // instant — words pop in fast
-    private val HOLD_MS          = 3_500L  // read time when 2 lines full
-    private val SILENCE_MS       = 8_000L  // fade after no speech
-    // Hindi words average 5-8 chars. At 20sp on a 12-inch tablet, ~32 chars per line.
-    // 2 lines = ~64 chars. Use 90 to be safe and truly fill both lines.
+    private val WORD_INTERVAL_MS = 0L
+    private val SILENCE_MS       = 8_000L
     private val LINE_CHARS       = 90
 
     private val tokenCounter  = AtomicLong(0)
@@ -96,6 +98,7 @@ class OverlayService : Service() {
         handler.post { if (running) buildOverlay() }
         pushCallback  = { _, hindi -> handler.post { onPush(hindi) } }
         clearCallback = { handler.post { onClear() } }
+        holdCallback  = { ms -> handler.post { holdMsVar = ms.coerceIn(1000, 15000) } }
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
@@ -103,7 +106,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         running = false
-        pushCallback = null; clearCallback = null
+        pushCallback = null; clearCallback = null; holdCallback = null
         handler.removeCallbacksAndMessages(null)
         queue.clear()
         if (viewAdded) {
@@ -206,7 +209,7 @@ class OverlayService : Service() {
                     isProgressing = false
                 }
             }
-            handler.postDelayed(holdRunnable!!, HOLD_MS)
+            handler.postDelayed(holdRunnable!!, holdMsVar)
             return
         }
 
@@ -244,7 +247,7 @@ class OverlayService : Service() {
             hideText()
             isProgressing = false
         }
-        handler.postDelayed(holdRunnable!!, HOLD_MS)
+        handler.postDelayed(holdRunnable!!, holdMsVar)
     }
 
     // ── Display helpers ───────────────────────────────────────────────────────
