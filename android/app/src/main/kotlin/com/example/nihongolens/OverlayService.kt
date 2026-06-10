@@ -41,7 +41,7 @@ class OverlayService : Service() {
     }
 
     // Timing — holdMsVar is user-controllable via Settings slider
-    @Volatile private var holdMsVar = 3_500L
+    @Volatile private var holdMsVar = 6_000L   // default: Average (6s)
 
     // ── Timing ────────────────────────────────────────────────────────────────
     // Words appear instantly (0ms gap) — fills 2 lines fast matching speech pace
@@ -99,17 +99,9 @@ class OverlayService : Service() {
         pushCallback  = { _, hindi -> handler.post { onPush(hindi) } }
         clearCallback = { handler.post { onClear() } }
         holdCallback  = { ms ->
-            val clamped = ms.coerceIn(1000, 15000)
-            handler.post {
-                holdMsVar = clamped
-                // If a hold timer is currently pending, cancel and reschedule
-                // with the new value so change takes effect immediately
-                val pending = holdRunnable
-                if (pending != null) {
-                    handler.removeCallbacks(pending)
-                    handler.postDelayed(pending, holdMsVar)
-                }
-            }
+            // Update value — takes effect on next hold cycle
+            // Does NOT interrupt current display (prevents pipeline break)
+            holdMsVar = ms.coerceIn(1000, 15000)
         }
     }
 
