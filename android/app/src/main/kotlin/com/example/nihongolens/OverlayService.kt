@@ -11,14 +11,18 @@ import android.util.TypedValue
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 
 /**
  * OverlayService — Progressive word-by-word Hindi subtitle overlay
  *
- * Single TextView, maxLines=2, words stream in at WORD_INTERVAL_MS pace.
- * When sentence complete or 2 lines full → hold HOLD_MS → clear → next sentence.
- * FIFO + token: no drops, no duplicates, no stale items after LC gone.
+ * Same data source as green UI subtitle → no skipping.
+ * Each sentence streams word-by-word, then holds for holdMsVar before clearing.
+ * FIFO queue with tokens — sentences show in order, stale items discarded on clear.
+ *
+ * Speed presets (set via setHoldMs):
+ *   Fastest = 2s, Fast = 4s, Average = 6s, Slow = 8s, Slowest = 10s
  */
 class OverlayService : Service() {
 
@@ -28,50 +32,48 @@ class OverlayService : Service() {
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
+
         @Volatile private var pushCallback:  ((String, String) -> Unit)? = null
         @Volatile private var clearCallback: (() -> Unit)?               = null
         @Volatile private var holdCallback:  ((Long) -> Unit)?           = null
 
         fun updateText(original: String, hindi: String) {
-            latestOriginal = original; latestHindi = hindi
+            latestOriginal = original
+            latestHindi    = hindi
             pushCallback?.invoke(original, hindi)
         }
+
         fun clearQueue() { clearCallback?.invoke() }
+
         fun setHoldMs(ms: Long) { holdCallback?.invoke(ms) }
     }
 
-    // Timing — holdMsVar is user-controllable via Settings slider
-    @Volatile private var holdMsVar = 6_000L   // default: Average (6s)
+    // ── State ─────────────────────────────────────────────────────────────────
 
-    // ── Timing ────────────────────────────────────────────────────────────────
-    // Words appear instantly (0ms gap) — fills 2 lines fast matching speech pace
-    // When 2 lines full: hold HOLD_MS so user can read, then clear and continue
-    // LINE_CHARS: approximate chars that fit 2 lines at 20sp on a tablet
-    private val WORD_INTERVAL_MS = 0L
-    private val SILENCE_MS       = 8_000L
-    private val LINE_CHARS       = 90
+    // User-controlled hold time — set via preset buttons, never mid-cycle
+    @Volatile private var holdMsVar = 6_000L   // default: Average
 
+    // FIFO sentence queue
     private val tokenCounter  = AtomicLong(0)
-    private var expectedToken = 0L
+    @Volatile private var expectedToken = 0L
 
-    data class Item(val token: Long, val words: List<String>)
-    private val queue = ArrayDeque<Item>()
+    data class Item(val token: Long, val text: String)
+    private val queue = LinkedBlockingQueue<Item>()
 
-    private var currentWords  = listOf<String>()   // kept for compat — not used in display
-    private var wordIndex     = 0
-    private var displayedText = ""
-    private var isProgressing = false
-    private var currentToken  = -1L
+    // Display state — only touched on main thread
+    private var isRunning_    = false   // display loop active
+    private var currentToken_ = -1L
 
-    private var wordRunnable:    Runnable? = null
-    private var holdRunnable:    Runnable? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var wordRunnable: Runnable? = null
+    private var holdRunnable: Runnable? = null
     private var silenceRunnable: Runnable? = null
 
+    // Overlay views
     private var windowManager: WindowManager?              = null
     private var textView:      TextView?                   = null
     private var overlayView:   View?                       = null
     private var params:        WindowManager.LayoutParams? = null
-    private val handler        = Handler(Looper.getMainLooper())
 
     @Volatile private var running   = true
     @Volatile private var viewAdded = false
@@ -84,24 +86,19 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                startForeground(NOTIF_ID, buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            else
-                startForeground(NOTIF_ID, buildNotification())
-        } catch (e: Exception) {
-            startForeground(NOTIF_ID, buildNotification())
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            startForeground(NOTIF_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        else startForeground(NOTIF_ID, buildNotification())
 
-        windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         handler.post { if (running) buildOverlay() }
+
         pushCallback  = { _, hindi -> handler.post { onPush(hindi) } }
         clearCallback = { handler.post { onClear() } }
         holdCallback  = { ms ->
-            // Update value — takes effect on next hold cycle
-            // Does NOT interrupt current display (prevents pipeline break)
-            holdMsVar = ms.coerceIn(1000, 15000)
+            // Only update holdMsVar — never interrupt current display cycle
+            holdMsVar = ms.coerceIn(1_000, 15_000)
         }
     }
 
@@ -120,157 +117,92 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── Push / Clear ──────────────────────────────────────────────────────────
+    // ── Queue management ──────────────────────────────────────────────────────
 
     private fun onPush(hindi: String) {
         if (hindi.isBlank()) return
-        val words = hindi.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.isEmpty()) return
-
         val token = tokenCounter.incrementAndGet()
-        queue.addLast(Item(token, words))
+        queue.put(Item(token, hindi.trim()))
         reschedSilence()
-        if (!isProgressing) startNext()
-        // If progressing, new words will be picked up by holdThenWait or next tickWords cycle
+        if (!isRunning_) showNext()
     }
 
     private fun onClear() {
+        // Advance expectedToken — all pending items silently skipped
         expectedToken = tokenCounter.get() + 1
         queue.clear()
         cancelAll()
-        allWords      = listOf()
-        allIndex      = 0
-        isProgressing = false
-        currentToken  = -1L
-        hideText()
+        isRunning_    = false
+        currentToken_ = -1L
+        fadeOut()
     }
 
-    // ── Progressive display ───────────────────────────────────────────────────
+    // ── Display loop ──────────────────────────────────────────────────────────
 
-    // allWords: flat list of all words from all currently queued sentences
-    // Rebuilt whenever startNext() or onPush() kicks display
-    private var allWords   = listOf<String>()
-    private var allIndex   = 0
-
-    private fun startNext() {
+    private fun showNext() {
         cancelAll()
-        while (queue.isNotEmpty() && queue.first().token < expectedToken)
-            queue.removeFirst()
-        if (queue.isEmpty()) { isProgressing = false; return }
 
-        // Drain ALL queued sentences into one flat word list
-        // This lets us fill 2 lines with content from multiple sentences
-        val words = mutableListOf<String>()
-        val tokens = mutableListOf<Long>()
-        while (queue.isNotEmpty()) {
-            val item = queue.removeFirst()
-            if (item.token < expectedToken) continue
-            words.addAll(item.words)
-            tokens.add(item.token)
-        }
-        if (words.isEmpty()) { isProgressing = false; return }
-
-        allWords      = words
-        allIndex      = 0
-        currentToken  = tokens.last()
-        isProgressing = true
-        displayedText = ""
-        hideText()
-        tickWords()
-    }
-
-    private fun tickWords() {
-        wordRunnable = null
-        if (!running || currentToken < expectedToken) {
-            isProgressing = false; hideText(); return
+        // Drain stale
+        while (true) {
+            val head = queue.peek() ?: break
+            if (head.token >= expectedToken) break
+            queue.poll()
         }
 
-        if (allIndex >= allWords.size) {
-            // All words shown — hold then wait for new content
-            holdThenWait(); return
-        }
-
-        // Append next word
-        val word = allWords[allIndex++]
-        displayedText = if (displayedText.isEmpty()) word else "$displayedText $word"
-        showText(displayedText)
-
-        // Check if 2 lines are full
-        if (displayedText.length >= LINE_CHARS) {
-            // 2 lines full — hold so user can read, then clear and continue
-            val cap = currentToken
-            holdRunnable = Runnable {
-                holdRunnable = null
-                if (!running || cap < expectedToken) { hideText(); isProgressing = false; return@Runnable }
-                displayedText = ""
-                hideText()
-                // If more words remain in allWords, continue ticking
-                if (allIndex < allWords.size) {
-                    tickWords()
-                } else if (queue.isNotEmpty()) {
-                    startNext()
-                } else {
-                    isProgressing = false
-                }
-            }
-            handler.postDelayed(holdRunnable!!, holdMsVar)
+        val item = queue.poll() ?: run {
+            isRunning_ = false
             return
         }
 
-        // More words — schedule next immediately or after interval
-        wordRunnable = Runnable { tickWords() }
-        if (WORD_INTERVAL_MS > 0) handler.postDelayed(wordRunnable!!, WORD_INTERVAL_MS)
-        else handler.post(wordRunnable!!)
+        if (item.token < expectedToken) { showNext(); return }
+
+        currentToken_ = item.token
+        isRunning_    = true
+
+        // Stream words one by one
+        val words = item.text.split(Regex("\\s+")).filter { it.isNotBlank() }
+        var index = 0
+        var displayed = ""
+
+        fun tick() {
+            wordRunnable = null
+            if (!running || item.token < expectedToken) {
+                isRunning_ = false; fadeOut(); return
+            }
+            if (index >= words.size) {
+                // Sentence complete — hold then advance
+                scheduleHold(item.token)
+                return
+            }
+            displayed = if (displayed.isEmpty()) words[index] else "$displayed ${words[index]}"
+            index++
+            setText(displayed)
+
+            // Schedule next word — interval based on sentence length for natural pace
+            // Short sentences: slower (more time per word)
+            // Long sentences: faster (need to fit in holdMsVar)
+            val totalWords  = words.size.coerceAtLeast(1)
+            val msPerWord   = (holdMsVar * 0.6 / totalWords).toLong().coerceIn(80, 400)
+            wordRunnable    = Runnable { tick() }
+            handler.postDelayed(wordRunnable!!, msPerWord)
+        }
+
+        tick()
     }
 
-    private fun holdThenWait() {
-        val cap = currentToken
+    private fun scheduleHold(token: Long) {
         holdRunnable = Runnable {
             holdRunnable = null
             if (!running) return@Runnable
-            if (cap < expectedToken) { isProgressing = false; hideText(); return@Runnable }
+            if (token < expectedToken) { isRunning_ = false; fadeOut(); return@Runnable }
+            // Hold complete — clear and show next
+            fadeOut()
+            isRunning_ = false
             if (queue.isNotEmpty()) {
-                // Seamlessly continue with newly arrived sentences
-                val words = mutableListOf<String>()
-                val tokens = mutableListOf<Long>()
-                while (queue.isNotEmpty()) {
-                    val item = queue.removeFirst()
-                    if (item.token < expectedToken) continue
-                    words.addAll(item.words)
-                    tokens.add(item.token)
-                }
-                if (words.isNotEmpty()) {
-                    // Append new words to current display without clearing
-                    allWords  = allWords + words
-                    currentToken = tokens.last()
-                    tickWords()
-                    return@Runnable
-                }
+                handler.postDelayed({ showNext() }, 150) // brief gap between sentences
             }
-            // Nothing new — clear and wait
-            hideText()
-            isProgressing = false
         }
         handler.postDelayed(holdRunnable!!, holdMsVar)
-    }
-
-    // ── Display helpers ───────────────────────────────────────────────────────
-
-    private fun showText(text: String) {
-        val tv = textView ?: return
-        tv.text  = text
-        if (tv.alpha < 0.5f) {
-            tv.animate().cancel()
-            tv.animate().alpha(1f).setDuration(150).start()
-        }
-    }
-
-    private fun hideText() {
-        val tv = textView ?: return
-        tv.animate().cancel()
-        tv.alpha = 0f
-        tv.text  = ""
-        displayedText = ""
     }
 
     private fun cancelAll() {
@@ -282,10 +214,25 @@ class OverlayService : Service() {
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
         silenceRunnable = Runnable {
-            if (!running || queue.isNotEmpty() || isProgressing) return@Runnable
-            hideText()
+            if (!running || queue.isNotEmpty() || isRunning_) return@Runnable
+            fadeOut()
         }
-        handler.postDelayed(silenceRunnable!!, SILENCE_MS)
+        handler.postDelayed(silenceRunnable!!, 10_000L)
+    }
+
+    // ── View helpers ──────────────────────────────────────────────────────────
+
+    private fun setText(text: String) {
+        val tv = textView ?: return
+        tv.text = text
+        if (tv.alpha < 0.5f) tv.animate().cancel().also { tv.animate().alpha(1f).setDuration(120).start() }
+    }
+
+    private fun fadeOut() {
+        textView?.animate()?.cancel()
+        textView?.animate()?.alpha(0f)?.setDuration(300)?.withEndAction {
+            textView?.text = ""
+        }?.start()
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
@@ -297,12 +244,9 @@ class OverlayService : Service() {
                 typeface  = Typeface.DEFAULT_BOLD
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
                 setTextColor(Color.WHITE)
-                // Strong multi-layer shadow for readability without background box
-                setShadowLayer(12f, 0f, 3f, Color.BLACK)
-                maxLines  = 2
-                setLineSpacing(dp(4).toFloat(), 1f)
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                background = null   // no background box
+                setShadowLayer(14f, 1f, 3f, Color.BLACK)
+                maxLines   = 2
+                background = null   // no box — text only
                 setPadding(dp(8), dp(4), dp(8), dp(4))
                 alpha = 0f
                 text  = ""
@@ -320,7 +264,10 @@ class OverlayService : Service() {
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
-            ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(90) }
+            ).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                y = dp(90)
+            }
 
             var sx = 0f; var sy = 0f; var ix = 0; var iy = 0
             tv.setOnTouchListener { _, ev ->
@@ -337,10 +284,10 @@ class OverlayService : Service() {
                 true
             }
 
-            windowManager?.addView(tv, params)
+            windowManager?.addView(overlayView, params)
             viewAdded = true
         } catch (e: Exception) {
-            android.util.Log.e("OverlayService", "buildOverlay failed: ${e.message}")
+            android.util.Log.e("OverlayService", "build: ${e.message}")
         }
     }
 
