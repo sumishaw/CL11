@@ -12,6 +12,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.sqrt
 
 /**
  * HindiTtsService
