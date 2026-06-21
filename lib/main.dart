@@ -40,7 +40,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool    hasOverlay       = false;
   bool    hasAccessibility = false;
   String  targetLang       = 'hindi';
-  double  subtitleSpeed    = 6.0;   // Average — matches preset
+  double  subtitleSpeed    = 6.0;
+  bool    ttsEnabled       = false;
+  String  ttsGender        = 'auto';   // 'auto', 'male', 'female'
+
+  Future<void> _setTtsEnabled(bool on) async {
+    await _ch.invokeMethod('setTtsEnabled', {'enabled': on});
+    if (mounted) setState(() => ttsEnabled = on);
+  }
+
+  Future<void> _setTtsGender(String gender) async {
+    await _ch.invokeMethod('setTtsGender', {'gender': gender});
+    if (mounted) setState(() => ttsGender = gender);
+  }
   String  statusMsg        = '';
   int     translationCount = 0;
   bool    _pulse           = false;
@@ -254,6 +266,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               const SizedBox(height: 16),
               _buildLangSelector(),
               _buildSubtitleSpeedSlider(),
+              _buildTtsControls(),
               const SizedBox(height: 16),
               if (originalText.isNotEmpty) ...[
                 _buildDetectedText(),
@@ -628,6 +641,98 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             );
           }).toList(),
         ),
+      ],
+    );
+  }
+
+  Widget _buildTtsControls() {
+    const accent = Color(0xFFFF3B3B);
+    final genders = [
+      {'label': '🔍 Auto', 'value': 'auto'},
+      {'label': '👨 Male',  'value': 'male'},
+      {'label': '👩 Female','value': 'female'},
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 20),
+        Row(children: [
+          const Text('Hindi Voice (TTS)',
+              style: TextStyle(color: Colors.white54, fontSize: 12,
+                  fontWeight: FontWeight.bold)),
+          const Spacer(),
+          GestureDetector(
+            onTap: () => _setTtsEnabled(!ttsEnabled),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: 48, height: 26,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(13),
+                color: ttsEnabled ? accent : Colors.white12,
+              ),
+              child: AnimatedAlign(
+                duration: const Duration(milliseconds: 200),
+                alignment: ttsEnabled
+                    ? Alignment.centerRight : Alignment.centerLeft,
+                child: Container(
+                  margin: const EdgeInsets.all(3),
+                  width: 20, height: 20,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: ttsEnabled ? Colors.white : Colors.white38,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ]),
+        if (ttsEnabled) ...[
+          const SizedBox(height: 10),
+          const Text('Voice Gender',
+              style: TextStyle(color: Colors.white38, fontSize: 11)),
+          const SizedBox(height: 8),
+          Row(children: genders.map((g) {
+            final val      = g['value']!;
+            final selected = ttsGender == val;
+            return Expanded(
+              child: GestureDetector(
+                onTap: () => _setTtsGender(val),
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 3),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color: selected ? accent : Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: selected ? accent : Colors.white12),
+                  ),
+                  child: Text(g['label']!,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.bold,
+                        color: selected ? Colors.white : Colors.white54,
+                      )),
+                ),
+              ),
+            );
+          }).toList()),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.white.withAlpha(13),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              ttsGender == 'auto'
+                  ? '🔍 Auto-detecting speaker gender from audio pitch'
+                  : ttsGender == 'male'
+                      ? '👨 Using male Hindi voice'
+                      : '👩 Using female Hindi voice',
+              style: const TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+          ),
+        ],
       ],
     );
   }
