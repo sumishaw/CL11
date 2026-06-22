@@ -339,53 +339,53 @@ class LiveCaptionReader : AccessibilityService() {
                 val (seq, text) = item
                 if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
 
-                val t0    = System.currentTimeMillis()
-                lastSentText = text   // track what was actually sent
-                val hindi = callServer(text)
-                val ms    = System.currentTimeMillis() - t0
+                val t0     = System.currentTimeMillis()
+                lastSentText = text
+                val result = callServer(text)
+                val ms     = System.currentTimeMillis() - t0
 
                 if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
 
-                if (hindi.isNullOrBlank()) {
+                if (result == null) {
                     errCount.incrementAndGet()
                     CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
                     continue
                 }
 
+                val (hindi, serverLang) = result
+
                 // Skip if same Hindi shown very recently
-                val now = System.currentTimeMillis()
+                val now   = System.currentTimeMillis()
                 val hNorm = norm(hindi)
                 if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
                     CaptionLogger.log(TAG, "SKIP dup Hindi")
-                    // Reset enqueued state so next event with new context can enqueue
-                    lastEnqueued = ""
-                    lastRawFull  = ""
+                    lastEnqueued = ""; lastRawFull = ""
                     continue
                 }
                 lastHindiOut  = hindi
                 lastHindiTime = now
 
                 okCount.incrementAndGet()
-                CaptionLogger.log(TAG, "OK $seq ${ms}ms '${hindi.take(50)}'")
+                CaptionLogger.log(TAG, "OK $seq ${ms}ms lang=$serverLang '${hindi.take(50)}'")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
 
-                // Auto gender detection from source text + language
+                // Auto gender: use server-detected language for best accuracy
                 if (HindiTtsService.selectedGender == HindiTtsService.Gender.AUTO) {
-                    HindiTtsService.detectedGender = GenderDetector.detect(text, confirmedLang)
+                    HindiTtsService.detectedGender =
+                        GenderDetector.detect(text, serverLang.ifBlank { confirmedLang })
                 }
 
                 withContext(Dispatchers.Main) {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
-                // Speak Hindi translation (non-blocking — queued in background)
                 HindiTtsService.speak(hindi)
             }
         }
     }
 
-    private fun callServer(text: String): String? {
+    private fun callServer(text: String): Pair<String, String>? {
         if (text.trim().length < 4) return null
         var conn: HttpURLConnection? = null
         return try {
@@ -400,8 +400,10 @@ class LiveCaptionReader : AccessibilityService() {
             if (conn.responseCode != 200) {
                 CaptionLogger.log(TAG, "HTTP ${conn.responseCode}"); return null
             }
-            JSONObject(conn.inputStream.bufferedReader().readText())
-                .optString("text", "").trim().takeIf { it.isNotBlank() }
+            val json = JSONObject(conn.inputStream.bufferedReader().readText())
+            val hindi = json.optString("text", "").trim()
+            val lang  = json.optString("detected_lang", confirmedLang)
+            if (hindi.isBlank()) null else Pair(hindi, lang)
         } catch (e: Exception) {
             CaptionLogger.log(TAG, "server ex: ${e.javaClass.simpleName}: ${e.message}"); null
         } finally {
