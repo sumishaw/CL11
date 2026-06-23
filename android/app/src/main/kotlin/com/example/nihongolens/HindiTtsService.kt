@@ -61,6 +61,13 @@ object HindiTtsService {
     // ── Init ──────────────────────────────────────────────────────────────────
 
     fun init(context: Context) {
+        // Block Live Captions from capturing TTS audio output
+        // ALLOW_CAPTURE_BY_NONE prevents any system service from capturing this app's audio
+        // This is the only reliable way to prevent the TTS→LiveCaptions→TTS loop
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.allowedCapturePolicy = android.media.AudioAttributes.ALLOW_CAPTURE_BY_NONE
+        }
         tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val res = tts?.setLanguage(Locale("hi", "IN"))
@@ -108,7 +115,7 @@ object HindiTtsService {
         val emotion = detectEmotion(hindi)
         val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
         val gender  = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
-        val pitch   = if (gender == Gender.FEMALE) 0.80f else 1.00f
+        val pitch   = if (gender == Gender.FEMALE) 1.3f else 1.0f
 
         engine.setSpeechRate(speed)
         engine.setPitch(pitch)
