@@ -49,7 +49,30 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            instance?.handler?.post { instance?.onNewHindi(hindi) }
+            // Only push to overlay when TTS is disabled
+            // When TTS enabled, HindiTtsService.showTtsText() drives the overlay
+            if (!HindiTtsService.enabled) {
+                instance?.handler?.post { instance?.onNewHindi(hindi) }
+            }
+        }
+
+        // Called by HindiTtsService — shows subtitle exactly when TTS speaks it
+        fun showTtsText(hindi: String) {
+            val tv = instance?.textView ?: return
+            tv.text = hindi
+            if (tv.alpha < 0.5f) {
+                tv.animate().cancel()
+                tv.animate().alpha(1f).setDuration(80).start()
+            }
+        }
+
+        // Called by HindiTtsService — clears subtitle when TTS finishes
+        fun clearTtsText() {
+            instance?.textView?.let { tv ->
+                tv.animate().cancel()
+                tv.animate().alpha(0f).setDuration(200)
+                    .withEndAction { tv.text = "" }.start()
+            }
         }
         fun clearQueue() {
             instance?.handler?.post { instance?.onClear() }
@@ -78,7 +101,7 @@ class OverlayService : Service() {
 
     // Views
     private var windowManager: WindowManager?              = null
-    private var textView:      TextView?                   = null
+    var textView:      TextView?                   = null
     private var overlayView:   View?                       = null
     private var params:        WindowManager.LayoutParams? = null
 
