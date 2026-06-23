@@ -103,21 +103,22 @@ object HindiTtsService {
     // ── Enqueue sentence ─────────────────────────────────────────────────────
 
     fun speak(hindi: String) {
-        if (!enabled) { Log.d(TAG, "speak() skipped — TTS disabled"); return }
+        if (!enabled) return
         if (hindi.isBlank()) return
         val n = hindi.trim().replace(Regex("\\s+"), " ")
-        if (n == lastSpokenNorm) { Log.d(TAG, "speak() dedup skip"); return }
+        if (n == lastSpokenNorm) return
         lastSpokenNorm = n
-        while (queue.size >= 4) queue.poll()
-        queue.offer(n)
-        Log.d(TAG, "speak() queued q=${queue.size} '${n.take(30)}'")
+        queue.offer(n)  // unbounded — never drops
+        Log.d(TAG, "TTS enqueued q=${queue.size} '${n.take(30)}'")
     }
 
     private fun startWorker() {
         // Stage A: Fetch worker — converts text → WAV in background
         val fetchJob2 = scope.launch {
             while (isActive) {
-                val text = queue.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                // take() — blocks until text available, never misses a sentence
+                val text = try { queue.take() }
+                           catch (_: InterruptedException) { continue }
                 if (!enabled) continue
                 val emotion = detectEmotion(text)
                 val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
@@ -128,12 +129,12 @@ object HindiTtsService {
                     val nCh  = readShort(wav, 22).coerceAtLeast(1)
                     val bits = readShort(wav, 34).coerceAtLeast(8)
                     val dur  = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
-                    // Drop oldest if backlogged — stay near real time
+                    // Keep max 3 in ready queue — drop oldest if far behind
                     while (readyQueue.size >= 3) readyQueue.poll()
                     readyQueue.offer(Triple(text, wav, dur))
-                    Log.d(TAG, "Fetched ${dur}ms WAV ready q=${readyQueue.size}")
+                    Log.d(TAG, "WAV ready ${dur}ms readyQ=${readyQueue.size}")
                 } else {
-                    Log.w(TAG, "Empty WAV — server running on :8766?")
+                    Log.w(TAG, "Empty WAV — is hindi_tts_server.py running on :8766?")
                 }
             }
         }
@@ -141,7 +142,9 @@ object HindiTtsService {
         // Stage B: Play worker — plays WAV and shows subtitle in sync
         worker = scope.launch {
             while (isActive) {
-                val item = readyQueue.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                // take() blocks until item available — never skips or times out
+                val item = try { readyQueue.take() }
+                           catch (_: InterruptedException) { continue }
                 if (!enabled) continue
                 val (text, wav, dur) = item
                 try {
@@ -154,8 +157,8 @@ object HindiTtsService {
                     Log.e(TAG, "Play: ${e.message}")
                 } finally {
                     isSpeaking = false
+                    hideSubtitle()
                 }
-                // No delay — fetch worker already has next WAV ready
             }
         }
     }
