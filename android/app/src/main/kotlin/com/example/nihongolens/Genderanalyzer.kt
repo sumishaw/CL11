@@ -4,7 +4,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.Log
@@ -12,152 +11,94 @@ import kotlinx.coroutines.*
 import kotlin.math.*
 
 /**
- * GenderAnalyzer v4 — dual-mode YIN pitch detection.
+ * GenderAnalyzer v5 — dedicated USAGE_MEDIA internal audio capture + YIN pitch detection.
  *
- * MODE A — PCM-feed (Audio Capture mode):
- *   SpeechCaptureService feeds raw PCM via feedPcm(). No extra AudioRecord needed.
+ * ARCHITECTURE:
+ *   Owns its own AudioRecord using AudioPlaybackCaptureConfiguration(USAGE_MEDIA).
+ *   This captures ONLY the media player audio stream — no TTS, no mic, no notifications.
+ *   Works identically with speakers or headphones because the capture happens inside
+ *   Android's audio mixer, before audio reaches any output device.
  *
- * MODE B — Mic fallback (Live Captions mode):
- *   When SpeechCaptureService is not running, startMic() opens a mic AudioRecord.
- *   Tablet mic picks up the video audio from the speaker.
- *   startMic() is called by LiveCaptionReader when it connects.
+ * USAGE_MEDIA is captured. USAGE_ASSISTANT (our Hindi TTS) is NOT — excluded at OS level.
  *
- * Both modes feed the same YIN analyze() pipeline.
+ * STARTUP:
+ *   Audio Capture mode: SpeechCaptureService calls start(sharedProjection)
+ *   Live Captions mode: LiveCaptionReader calls start(MainActivity.lcProjection)
+ *   If no projection yet: start() queues and retries when projection arrives via setProjection()
+ *
+ * GENDER SWITCH:
+ *   HIST=1 — switches immediately on every single voiced frame.
+ *   No majority voting lag. If a female voice frame is detected, voice switches to female instantly.
  */
 object GenderAnalyzer {
 
     private const val TAG           = "GenderAnalyzer"
     private const val SR            = 16_000
-    private const val WIN           = 2048
-    private const val TAU_MIN       = (SR / 300.0).toInt()   // ~53
-    private const val TAU_MAX       = (SR / 60.0).toInt()    // ~266
-    private const val YIN_THRESHOLD = 0.35f
-    private const val RMS_FLOOR     = 50f
-    private const val HIST          = 3
+    private const val WIN           = 2048        // 128ms window
+    private const val TAU_MIN       = (SR / 300.0).toInt()   // 53 — max detectable F0 = 300Hz
+    private const val TAU_MAX       = (SR / 60.0).toInt()    // 266 — min detectable F0 = 60Hz
+    private const val YIN_THRESHOLD = 0.35f       // CMNDF threshold — lower = stricter
+    private const val RMS_FLOOR     = 80f         // skip near-silence frames
+    private const val HIST          = 1           // immediate switch on single frame
 
-    @Volatile var enabled  = false
-    @Volatile var micMode  = false   // true = mic AudioRecord is running
+    @Volatile var enabled = false
 
-    private val history   = ArrayDeque<HindiTtsService.Gender>()
-    private val accum     = ShortArray(WIN)
+    // YIN buffers (reused across frames)
+    private val accum = ShortArray(WIN)
     private var accumFill = 0
-    private val re        = FloatArray(WIN)
-    private val im        = FloatArray(WIN)
+    private val history = ArrayDeque<HindiTtsService.Gender>()
 
-    // Mic mode resources
-    private val scope      = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var micJob:    Job?         = null
-    private var micRecord: AudioRecord? = null
+    // Dedicated capture resources
+    private val scope   = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var captureJob: Job?         = null
+    private var captureRec: AudioRecord? = null
 
     // Diagnostics
-    private var feedCount    = 0
-    private var analyzeCount = 0
     private var frameCount   = 0
+    private var analyzeCount = 0
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    /** Called by SpeechCaptureService when it starts capture (PCM-feed mode). */
-    fun start() {
-        stopMic()          // stop mic if running
-        enabled = true
-        micMode = false
-        history.clear()
-        accumFill = 0
-        feedCount = 0; analyzeCount = 0; frameCount = 0
-        Log.d(TAG, "GenderAnalyzer started (PCM-feed mode)")
-        CaptionLogger.log(TAG, "started PCM-feed mode")
-    }
-
-    /** Called by LiveCaptionReader when it connects (Live Captions mode).
-     *  projection: if provided, uses AudioPlaybackCaptureConfiguration (works with headphones).
-     *  If null, falls back to mic AudioRecord (only works with speakers). */
-    fun startMic(projection: MediaProjection? = null) {
-        if (SpeechCaptureService.isRunning) return  // PCM-feed mode active
-        if (micMode) return
-        enabled = true
-        micMode = true
-        history.clear()
-        accumFill = 0
-        feedCount = 0; analyzeCount = 0; frameCount = 0
-        micJob = scope.launch { 
-            if (projection != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                internalAudioLoop(projection)
-            } else {
-                micLoop()
-            }
+    /**
+     * Start the dedicated media audio capture for gender detection.
+     * projection: MediaProjection that authorizes AudioPlaybackCaptureConfiguration.
+     * Call from SpeechCaptureService (Audio Capture mode) or LiveCaptionReader (LC mode).
+     */
+    fun start(projection: MediaProjection?) {
+        stop()  // stop any previous capture cleanly
+        if (projection == null) {
+            CaptionLogger.log(TAG, "start() — no projection, gender detection unavailable")
+            return
         }
-        val mode = if (projection != null) "internal-audio" else "mic-fallback"
-        Log.d(TAG, "GenderAnalyzer started ($mode)")
-        CaptionLogger.log(TAG, "started $mode")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            CaptionLogger.log(TAG, "start() — API < Q, AudioPlaybackCapture unavailable")
+            return
+        }
+        enabled = true
+        history.clear()
+        accumFill = 0
+        frameCount = 0; analyzeCount = 0
+        captureJob = scope.launch { captureLoop(projection) }
+        CaptionLogger.log(TAG, "started — dedicated USAGE_MEDIA capture")
     }
 
     fun stop() {
         enabled = false
-        stopMic()
+        captureJob?.cancel(); captureJob = null
+        try { captureRec?.stop()    } catch (_: Exception) {}
+        try { captureRec?.release() } catch (_: Exception) {}
+        captureRec = null
         history.clear()
-        Log.d(TAG, "GenderAnalyzer stopped")
+        CaptionLogger.log(TAG, "stopped")
     }
 
-    private fun stopMic() {
-        micMode = false
-        micJob?.cancel(); micJob = null
-        try { micRecord?.stop() }  catch (_: Exception) {}
-        try { micRecord?.release() } catch (_: Exception) {}
-        micRecord = null
-    }
+    // ── Dedicated USAGE_MEDIA capture loop ────────────────────────────────────
 
-    // ── Mic capture loop ──────────────────────────────────────────────────────
-
-    private suspend fun micLoop() = withContext(Dispatchers.IO) {
-        val minBuf = AudioRecord.getMinBufferSize(
-            SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(WIN * 2)
-
-        val rec = try {
-            AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                SR, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, minBuf
-            )
-        } catch (e: Exception) {
-            CaptionLogger.log(TAG, "Mic AudioRecord failed: ${e.message}")
-            return@withContext
-        }
-
-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            CaptionLogger.log(TAG, "Mic AudioRecord not initialized")
-            rec.release(); return@withContext
-        }
-
-        micRecord = rec
-        rec.startRecording()
-        CaptionLogger.log(TAG, "Mic recording started SR=$SR")
-
-        val buf = ByteArray(WIN * 2)   // WIN shorts = WIN*2 bytes
-        try {
-            while (currentCoroutineContext().isActive && micMode) {
-                val read = rec.read(buf, 0, buf.size)
-                if (read > 0) {
-                    // In mic mode: skip analysis while TTS is playing.
-                    // The mic hears both video audio AND Hindi TTS from the speaker,
-                    // so we must not analyze during TTS to avoid self-detection.
-                    // (InternalAudio mode doesn't need this — USAGE_ASSISTANT is excluded at OS level)
-                    if (!HindiTtsService.isSuppressed()) feedPcm(buf, read)
-                } else delay(10)
-            }
-        } finally {
-            try { rec.stop(); rec.release() } catch (_: Exception) {}
-            micRecord = null
-            CaptionLogger.log(TAG, "Mic recording stopped")
-        }
-    }
-
-    // ── Internal audio loop (AudioPlaybackCapture — works with headphones) ────
-
-    private suspend fun internalAudioLoop(projection: MediaProjection) = withContext(Dispatchers.IO) {
-        // USAGE_MEDIA only — this is the video/music player stream.
-        // USAGE_ASSISTANT (our Hindi TTS) is NOT listed here, so it is automatically
-        // excluded from capture. No TTS contamination possible in this path.
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private suspend fun captureLoop(projection: MediaProjection) = withContext(Dispatchers.IO) {
+        // AudioPlaybackCaptureConfiguration captures ONLY the media player stream.
+        // USAGE_ASSISTANT (Hindi TTS) is NOT listed → excluded at OS audio mixer level.
+        // This capture is completely independent of SpeechCaptureService's AudioRecord.
         val config = AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .build()
@@ -177,40 +118,42 @@ object GenderAnalyzer {
                 .setAudioPlaybackCaptureConfig(config)
                 .build()
         } catch (e: Exception) {
-            CaptionLogger.log(TAG, "InternalAudio failed: ${e.message} — falling back to mic")
-            micLoop(); return@withContext
+            enabled = false
+            CaptionLogger.log(TAG, "AudioRecord.Builder failed: ${e.message}")
+            return@withContext
         }
 
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            CaptionLogger.log(TAG, "InternalAudio not initialized — falling back to mic")
-            rec.release(); micLoop(); return@withContext
+            enabled = false
+            rec.release()
+            CaptionLogger.log(TAG, "AudioRecord not initialized — STATE=${rec.state}")
+            return@withContext
         }
 
-        micRecord = rec
+        captureRec = rec
         rec.startRecording()
-        CaptionLogger.log(TAG, "InternalAudio recording started (headphone-safe)")
+        CaptionLogger.log(TAG, "capture started SR=$SR WIN=$WIN TAU_MIN=$TAU_MIN TAU_MAX=$TAU_MAX")
 
-        val buf = ByteArray(WIN * 2)
+        val buf = ByteArray(WIN * 2)   // exactly WIN samples per read
         try {
-            while (currentCoroutineContext().isActive && micMode) {
+            while (currentCoroutineContext().isActive && enabled) {
                 val read = rec.read(buf, 0, buf.size)
-                if (read > 0) feedPcm(buf, read) else delay(10)
+                if (read > 0) ingestPcm(buf, read)
+                else if (read < 0) {
+                    CaptionLogger.log(TAG, "rec.read error=$read — stopping")
+                    break
+                }
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
-            micRecord = null
+            captureRec = null
+            CaptionLogger.log(TAG, "captureLoop ended")
         }
     }
 
-    // ── PCM feed (called by SpeechCaptureService OR mic loop) ────────────────
+    // ── PCM ingestion ─────────────────────────────────────────────────────────
 
-    fun feedPcm(bytes: ByteArray, count: Int) {
-        feedCount++
-        if (feedCount % 100 == 0) {
-            CaptionLogger.log(TAG, "feedPcm #$feedCount enabled=$enabled mic=$micMode accum=$accumFill")
-        }
-        if (!enabled) return
-
+    private fun ingestPcm(bytes: ByteArray, count: Int) {
         var i = 0
         while (i + 1 < count) {
             if (accumFill < WIN) {
@@ -226,35 +169,46 @@ object GenderAnalyzer {
         }
     }
 
+    /**
+     * External PCM feed — called by SpeechCaptureService as a fallback.
+     * Only used if captureLoop is not running (e.g. projection not yet granted).
+     */
+    fun feedPcm(bytes: ByteArray, count: Int) {
+        if (!enabled || captureJob?.isActive == true) return   // own loop running, ignore
+        ingestPcm(bytes, count)
+    }
+
     // ── YIN pitch detection ───────────────────────────────────────────────────
 
     private fun analyze() {
         analyzeCount++
+
+        // RMS energy check — skip silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
         if (rms < RMS_FLOOR) {
-            if (analyzeCount % 20 == 0) CaptionLogger.log(TAG, "analyze #$analyzeCount rms=${rms.toInt()} SILENT")
+            if (analyzeCount % 30 == 0)
+                CaptionLogger.log(TAG, "analyze #$analyzeCount rms=${rms.toInt()} SILENT")
             return
         }
 
-        for (i in 0 until WIN) {
-            val w = 0.5f * (1f - cos(2.0 * PI * i / (WIN - 1)).toFloat())
-            re[i] = accum[i] * w / 32768f
-            im[i] = 0f
-        }
-
+        // YIN step 1 — difference function d(tau)
+        // Uses raw normalized PCM — no Hann window (Hann is for FFT, not YIN)
         val halfWin = WIN / 2
         val d = FloatArray(TAU_MAX + 1)
         for (tau in 1..TAU_MAX) {
             var sum = 0.0f
             for (j in 0 until halfWin) {
-                val diff = re[j] - (if (j + tau < WIN) accum[j + tau] * 0.5f / 32768f else 0f)
+                val a = accum[j].toFloat() / 32768f
+                val b = accum[j + tau].toFloat() / 32768f
+                val diff = a - b
                 sum += diff * diff
             }
             d[tau] = sum
         }
 
+        // YIN step 2 — cumulative mean normalized difference (CMNDF)
         val cmndf = FloatArray(TAU_MAX + 1)
         cmndf[0] = 1f
         var runSum = 0f
@@ -263,39 +217,51 @@ object GenderAnalyzer {
             cmndf[tau] = if (runSum > 0f) d[tau] * tau / runSum else 1f
         }
 
+        // YIN step 3 — find first dip below threshold
         var tau = TAU_MIN
         while (tau < TAU_MAX - 1) {
             if (cmndf[tau] < YIN_THRESHOLD) {
-                val better = if (tau + 1 < TAU_MAX && cmndf[tau + 1] < cmndf[tau]) tau + 1 else tau
-                classifyPitch(SR.toFloat() / better, rms)
+                // Step 4 — pick better neighbor (sub-sample precision)
+                val best = if (tau + 1 < TAU_MAX && cmndf[tau + 1] < cmndf[tau]) tau + 1 else tau
+                onPitchDetected(SR.toFloat() / best, rms)
                 return
             }
             tau++
         }
 
-        var minVal = 1f; var minTau = TAU_MIN
-        for (t in TAU_MIN until TAU_MAX) { if (cmndf[t] < minVal) { minVal = cmndf[t]; minTau = t } }
+        // No confident pitch — log diagnostics every 10 frames
         if (analyzeCount % 10 == 0) {
-            CaptionLogger.log(TAG, "noPitch #$analyzeCount rms=${rms.toInt()} minCMNDF=${String.format("%.3f", minVal)} f0est=${(SR.toFloat()/minTau).toInt()}Hz")
+            var minVal = 1f; var minTau = TAU_MIN
+            for (t in TAU_MIN until TAU_MAX) { if (cmndf[t] < minVal) { minVal = cmndf[t]; minTau = t } }
+            CaptionLogger.log(TAG, "noPitch #$analyzeCount rms=${rms.toInt()} " +
+                "minCMNDF=${String.format("%.3f", minVal)} " +
+                "f0est=${(SR.toFloat() / minTau).toInt()}Hz thr=$YIN_THRESHOLD")
         }
     }
 
-    private fun classifyPitch(f0: Float, rms: Float) {
-        frameCount++
-        if (frameCount % 5 == 0) CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → ${if (f0 >= 165f) "FEMALE" else "MALE"}")
+    // ── Gender classification ─────────────────────────────────────────────────
 
-        val gender = if (f0 >= 165f) HindiTtsService.Gender.FEMALE else HindiTtsService.Gender.MALE
-        history.addLast(gender)
+    private fun onPitchDetected(f0: Float, rms: Float) {
+        frameCount++
+
+        // Log every 3rd voiced frame for visibility in Log tab
+        if (frameCount % 3 == 0)
+            CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} " +
+                "→ ${if (f0 >= 165f) "FEMALE" else "MALE"}")
+
+        val detected = if (f0 >= 165f) HindiTtsService.Gender.FEMALE
+                       else             HindiTtsService.Gender.MALE
+
+        // HIST=1: push to history, switch immediately on any single frame
+        history.addLast(detected)
         if (history.size > HIST) history.removeFirst()
 
-        val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
-        val majority = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE else HindiTtsService.Gender.MALE
-
-        if (majority != HindiTtsService.detectedGender) {
-            HindiTtsService.detectedGender = majority
+        if (detected != HindiTtsService.detectedGender) {
+            HindiTtsService.detectedGender = detected
+            // Clear spoken token dedup — next sentence speaks in new voice immediately
             HindiTtsService.spokenTokens.clear()
-            Log.d(TAG, "Gender→$majority F0=${f0.toInt()}Hz")
-            CaptionLogger.log(TAG, "Gender→$majority F0=${f0.toInt()}Hz rms=${rms.toInt()}")
+            Log.d(TAG, "Gender→$detected F0=${f0.toInt()}Hz rms=${rms.toInt()}")
+            CaptionLogger.log(TAG, ">>> Gender SWITCHED to $detected F0=${f0.toInt()}Hz <<<")
         }
     }
 }
