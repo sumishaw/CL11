@@ -340,7 +340,7 @@ class LiveCaptionReader : AccessibilityService() {
 
     // Cap text to max N words to avoid huge multi-sentence translations
     private fun capWords(text: String, maxWords: Int): String {
-        val words = text.trim().split(Regex("\s+"))
+        val words = text.trim().split(Regex("\\s+"))
         return if (words.size <= maxWords) text.trim()
                else words.take(maxWords).joinToString(" ")
     }
