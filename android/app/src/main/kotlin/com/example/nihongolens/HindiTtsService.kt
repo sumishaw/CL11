@@ -189,10 +189,13 @@ object HindiTtsService {
         genderHistory.addLast(newG)
         if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
         val fCount = genderHistory.count { it == Gender.FEMALE }
-        val majority = if (fCount > genderHistory.size / 2) Gender.FEMALE else Gender.MALE
+        // Switch on 3/5 majority (60%) — faster than waiting for 8 samples
+        val threshold = (genderHistory.size * 0.55).toInt()
+        val majority = if (fCount >= threshold) Gender.FEMALE else Gender.MALE
         if (majority != detectedGender) {
             detectedGender = majority
-            android.util.Log.d("HindiTTS", "Gender→$majority f=$fScore m=$mScore lang=$normalizedLang '${srcText.take(40)}'")
+            android.util.Log.d("HindiTTS", "Gender→$majority f=$fScore m=$mScore lang=$normalizedLang hist=${genderHistory.size} '${srcText.take(40)}'")
+            CaptionLogger.log("HindiTTS", "Gender switched to $majority (fScore=$fScore mScore=$mScore)")
         }
     }
 
@@ -335,12 +338,44 @@ object HindiTtsService {
 
     // ── Gender poller ─────────────────────────────────────────────────────────
 
-    // Gender detection is now handled by GenderAnalyzer.kt
-    // which uses AudioPlaybackCaptureConfiguration + MediaProjection
-    // to capture real media audio and run FFT gender analysis.
-    // This function is kept for compatibility but is a no-op.
+    // Two-layer gender detection:
+    // Layer 1 (primary): GenderAnalyzer.kt — real audio FFT via MediaProjection
+    // Layer 2 (fallback): HTTP poll /gender on whisper_server every 3s
+    //   whisper_server /gender endpoint returns pitch analysis from mic/playback
+    //   This fires if MediaProjection was not granted or GenderAnalyzer lost audio
     private fun startGenderPoller() {
-        Log.d(TAG, "Gender detection delegated to GenderAnalyzer (MediaProjection-based)")
+        Log.d(TAG, "Gender poller started (fallback layer)")
+        scope.launch(Dispatchers.IO) {
+            var failStreak = 0
+            while (isActive) {
+                delay(3_000L)
+                if (selectedGender != Gender.AUTO) continue
+                try {
+                    val conn = URL(GENDER_URL).openConnection() as java.net.HttpURLConnection
+                    conn.requestMethod  = "GET"
+                    conn.connectTimeout = 2_000
+                    conn.readTimeout    = 3_000
+                    if (conn.responseCode == 200) {
+                        val json = org.json.JSONObject(conn.inputStream.bufferedReader().readText())
+                        val g = json.optString("gender", "")
+                        if (g == "female" || g == "male") {
+                            val newG = if (g == "female") Gender.FEMALE else Gender.MALE
+                            if (newG != detectedGender) {
+                                detectedGender = newG
+                                Log.d(TAG, "GenderPoller→$newG (audio pitch)")
+                                CaptionLogger.log(TAG, "Gender fallback→$g")
+                            }
+                        }
+                        failStreak = 0
+                    }
+                    conn.disconnect()
+                } catch (_: Exception) {
+                    failStreak++
+                    // Back off after 5 consecutive failures (server not running)
+                    if (failStreak > 5) delay(15_000L)
+                }
+            }
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
