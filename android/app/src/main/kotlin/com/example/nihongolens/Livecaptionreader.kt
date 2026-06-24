@@ -331,12 +331,13 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // TRIGGER 2: grew by 6+ words since last translation
+        // TRIGGER 2: natural phrase boundary — 5+ word growth OR 8+ words total
+        // Lower threshold catches spoken phrases faster without waiting for silence
         val grown = wordCount - lastEnqueuedWordCount
-        if (grown >= 4 && wordCount >= 4) {
+        if ((grown >= 5 && wordCount >= 5) || (wordCount >= 8 && grown >= 3)) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(200)  // brief settle for word correction
+                delay(150)  // brief settle for word correction
                 val t = capWords(sentenceBuffer.trim(), 12)
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
@@ -396,11 +397,10 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // LOOP PREVENTION 2: Block completely during TTS speaking + grace period
-        if (HindiTtsService.isSuppressed()) {
-            CaptionLogger.log(TAG, "SKIP: TTS suppressed (anti-loop)")
-            return
-        }
+        // NOTE: isSuppressed() check removed — subtitle display is independent of TTS.
+        // TTS loop is prevented by: (1) Devanagari guard above, (2) romanized Hindi guard,
+        // (3) USAGE_ASSISTANT audio attribute (excluded from Live Captions capture).
+        // Blocking subtitle on isSuppressed caused 4-6s display delay per sentence.
 
         val n = norm(text)
         if (n == lastEnqueued || n == norm(lastSentText)) {
