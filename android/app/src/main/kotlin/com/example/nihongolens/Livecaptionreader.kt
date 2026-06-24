@@ -219,12 +219,17 @@ class LiveCaptionReader : AccessibilityService() {
         val prev    = lastRawFull
         lastRawFull = full
 
-        // Return partial content for the sentence buffer in schedule()
-        // Do NOT enqueue directly here — sentence buffer handles complete sentences
-        val newContent = if (prev.isNotEmpty() && full.startsWith(prev))
+        // Get only the NEW text added since last read
+        val newText = if (prev.isNotEmpty() && full.startsWith(prev))
             full.substring(prev.length).trim()
-        else full.trim()
-        if (newContent.length >= 4) return newContent
+        else {
+            // LC window scrolled or reset — use only the last sentence of full text
+            // Split by sentence boundary and take the last complete-looking sentence
+            val sentences = full.split(Regex("""(?<=[.!?。！？])\s+"""))
+            sentences.lastOrNull { it.trim().length >= 4 }?.trim() ?: return null
+        }
+
+        if (newText.length >= 4) return newText
         return null
     }
 
@@ -295,41 +300,49 @@ class LiveCaptionReader : AccessibilityService() {
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
 
+        // Use the latest LC text — LC window grows incrementally
         sentenceBuffer = text
         lastLCChangeMs = System.currentTimeMillis()
 
-        // Trigger on sentence-ending punctuation
         val trimmed = text.trim()
         val endsWithPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
-                            trimmed.endsWith("!") || trimmed.endsWith("。") ||
-                            trimmed.endsWith("？") || trimmed.endsWith("！") ||
-                            trimmed.endsWith("…")
+                            trimmed.endsWith("!") || trimmed.endsWith(".") ||
+                            trimmed.endsWith("。") || trimmed.endsWith("？") ||
+                            trimmed.endsWith("！") || trimmed.endsWith("…")
         if (endsWithPunct) {
             sentenceTimerJob?.cancel()
             pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(400)   // wait for LC to finish correcting last word
-                if (sentenceBuffer.isNotBlank() && shouldEnqueue(sentenceBuffer)) {
-                    lastBufferEnqueued = sentenceBuffer
-                    enqueue(sentenceBuffer)
+                delay(400)
+                val buf = capWords(sentenceBuffer.trim(), 18)
+                if (buf.isNotBlank() && shouldEnqueue(buf)) {
+                    lastBufferEnqueued = buf
+                    enqueue(buf)
                     sentenceBuffer = ""
                 }
             }
             return
         }
 
-        // Silence trigger — LC stopped updating
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            if (sentenceBuffer.isNotBlank() && shouldEnqueue(sentenceBuffer)) {
+            val buf = capWords(sentenceBuffer.trim(), 18)
+            if (buf.isNotBlank() && shouldEnqueue(buf)) {
                 CaptionLogger.log(TAG, "SILENCE translate")
-                lastBufferEnqueued = sentenceBuffer
-                enqueue(sentenceBuffer)
+                lastBufferEnqueued = buf
+                enqueue(buf)
                 sentenceBuffer = ""
             }
         }
         pendingJob?.cancel()
+    }
+
+    // Cap text to max N words to avoid huge multi-sentence translations
+    private fun capWords(text: String, maxWords: Int): String {
+        val words = text.trim().split(Regex("\s+"))
+        return if (words.size <= maxWords) text.trim()
+               else words.take(maxWords).joinToString(" ")
     }
 
     private fun enqueue(text: String) {
