@@ -169,6 +169,7 @@ class SpeechCaptureService : Service() {
         captureThread?.interrupt(); captureThread = null
         workerThread?.interrupt();  workerThread  = null
         audioQueue.clear()
+        GenderAnalyzer.stop()
         try { audioRecord?.stop()    } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
@@ -253,6 +254,8 @@ class SpeechCaptureService : Service() {
 
         capturing.set(true)
         ar.startRecording()
+        // Start GenderAnalyzer — it will receive PCM via feedPcm() from our capture loop
+        GenderAnalyzer.start()
         updateNotification("Translating video audio to Hindi…")
         mainHandler.post { OverlayService.updateText("", "") }
 
@@ -276,6 +279,9 @@ class SpeechCaptureService : Service() {
                     read == AudioRecord.ERROR_BAD_VALUE) continue
                 if (read < 0) break
                 if (read == 0) continue
+
+                // Feed raw PCM to GenderAnalyzer — shares our AudioRecord, no second capture needed
+                GenderAnalyzer.feedPcm(readBuf, read)
 
                 var src = 0
                 while (src < read) {
