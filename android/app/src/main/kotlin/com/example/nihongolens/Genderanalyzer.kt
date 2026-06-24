@@ -117,14 +117,15 @@ object GenderAnalyzer {
         val femaleRatio = femaleE / totalE
 
         // Gender decision — widened female thresholds
-        val detected: HindiTtsService.Gender? = when {
+        // Use ?: return so detected is smart-cast to non-null Gender
+        val detected: HindiTtsService.Gender = when {
             centroid > 1800f && femaleRatio > 0.40f -> HindiTtsService.Gender.FEMALE
             centroid > 1600f && femaleRatio > 0.50f -> HindiTtsService.Gender.FEMALE
             centroid > 1500f && femaleRatio > 0.60f -> HindiTtsService.Gender.FEMALE
             centroid < 1500f && maleE > femaleE * 1.2f -> HindiTtsService.Gender.MALE
             centroid < 1700f && maleE > femaleE * 1.6f -> HindiTtsService.Gender.MALE
-            else -> null  // ambiguous frame — don't vote
-        } ?: return
+            else -> return  // ambiguous frame — skip
+        }
 
         history.addLast(detected)
         if (history.size > HIST) history.removeFirst()
