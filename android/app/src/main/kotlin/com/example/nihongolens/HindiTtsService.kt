@@ -143,6 +143,48 @@ object HindiTtsService {
         fetchQueue.offer(FetchItem(n, gender, speed))
     }
 
+
+    // Called from LiveCaptionReader with original source text + confirmed language
+    // Detects gender from pronouns — works for all 9 languages, no audio needed
+    fun updateGenderFromSource(srcText: String, lang: String) {
+        if (selectedGender != Gender.AUTO) return
+        val t = srcText.lowercase()
+        val fScore = when (lang) {
+            "en" -> listOf(" she "," her "," mrs ","woman","girl","lady","mother","sister","daughter","wife","aunt","queen","princess").count { t.contains(it) }
+            "es" -> listOf(" ella ","señora","mamá","mujer","chica","hermana").count { t.contains(it) }
+            "fr" -> listOf(" elle ","madame","femme","fille","mère","sœur").count { t.contains(it) }
+            "de" -> listOf(" sie ","frau","mutter","schwester","mädchen").count { t.contains(it) }
+            "ja" -> listOf("彼女","女","姉","妹","母","娘","女性","あたし").count { t.contains(it) }
+            "zh" -> listOf("她","姐","妹","妈","女士","小姐").count { t.contains(it) }
+            "ko" -> listOf("그녀","여자","언니","누나","어머니").count { t.contains(it) }
+            "ru" -> listOf("она "," её ","женщина","девушка","сестра").count { t.contains(it) }
+            "ar" -> listOf("هي","امرأة","بنت","أخت","أم").count { t.contains(it) }
+            else -> 0
+        }
+        val mScore = when (lang) {
+            "en" -> listOf(" he "," him "," his "," mr ","man ","boy ","father","brother","son ","husband","uncle","king","prince").count { t.contains(it) }
+            "es" -> listOf(" él ","señor","papá","hombre","chico","hermano").count { t.contains(it) }
+            "fr" -> listOf(" il ","monsieur","homme","garçon","père","frère").count { t.contains(it) }
+            "de" -> listOf(" er ","herr","vater","bruder","mann","junge").count { t.contains(it) }
+            "ja" -> listOf("彼 ","男","兄","弟","父","息子","俺","僕").count { t.contains(it) }
+            "zh" -> listOf("他 ","哥","弟","爸","先生","男士").count { t.contains(it) }
+            "ko" -> listOf("그는","남자","오빠","형","아버지").count { t.contains(it) }
+            "ru" -> listOf("он "," его ","мужчина","парень","брат","папа").count { t.contains(it) }
+            "ar" -> listOf("هو","رجل","ولد","أخ","أب").count { t.contains(it) }
+            else -> 0
+        }
+        if (fScore == 0 && mScore == 0) return
+        val newG = if (fScore > mScore) Gender.FEMALE else Gender.MALE
+        genderHistory.addLast(newG)
+        if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
+        val fCount = genderHistory.count { it == Gender.FEMALE }
+        val majority = if (fCount > genderHistory.size / 2) Gender.FEMALE else Gender.MALE
+        if (majority != detectedGender) {
+            detectedGender = majority
+            android.util.Log.d("HindiTTS", "Gender→$majority f=$fScore m=$mScore lang=$lang '${srcText.take(30)}'")
+        }
+    }
+
     // ── Fetch worker (Piper HTTP → WAV) ───────────────────────────────────────
 
     private fun startFetchWorker() {
