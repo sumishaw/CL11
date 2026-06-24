@@ -34,7 +34,7 @@ object GenderAnalyzer {
     private var job: Job? = null
 
     private val history  = ArrayDeque<HindiTtsService.Gender>()
-    private const val HIST = 8
+    private const val HIST = 3
 
     fun start(projection: MediaProjection) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -93,9 +93,11 @@ object GenderAnalyzer {
 
         try {
             while (currentCoroutineContext().isActive) {
-                // Skip while TTS is playing — avoid detecting our own voice
+                // TTS playing: drain buffer to stay current, but don't analyze
+                // (avoids 4-6s blind spot; our USAGE_ASSISTANT audio is excluded from capture anyway)
                 if (HindiTtsService.isSuppressed()) {
-                    delay(300); continue
+                    rec.read(buf, 0, N)   // drain so we don't analyze stale audio after TTS ends
+                    delay(50); continue
                 }
                 // Skip if gender manually set
                 if (HindiTtsService.selectedGender != HindiTtsService.Gender.AUTO) {
@@ -109,7 +111,7 @@ object GenderAnalyzer {
                 var energy = 0.0
                 for (i in 0 until N) energy += buf[i].toLong() * buf[i]
                 val rms = sqrt(energy / N)
-                if (rms < 50) { delay(30); continue }
+                if (rms < 30) { delay(20); continue }
 
                 // Hann window + copy to FFT arrays
                 for (i in 0 until N) {
@@ -147,12 +149,13 @@ object GenderAnalyzer {
                 val totalE   = maleE + femaleE + 1e-6f
                 val femaleRatio = femaleE / totalE
 
-                // Combined decision
+                // Combined decision — widened female range, lowered male certainty bar
                 val detected: HindiTtsService.Gender? = when {
-                    centroid > 1900f && femaleRatio > 0.45f -> HindiTtsService.Gender.FEMALE
-                    centroid > 1700f && femaleRatio > 0.55f -> HindiTtsService.Gender.FEMALE
-                    centroid < 1500f && maleE > femaleE * 1.4f -> HindiTtsService.Gender.MALE
-                    centroid < 1700f && maleE > femaleE * 2.0f -> HindiTtsService.Gender.MALE
+                    centroid > 1800f && femaleRatio > 0.40f -> HindiTtsService.Gender.FEMALE
+                    centroid > 1600f && femaleRatio > 0.50f -> HindiTtsService.Gender.FEMALE
+                    centroid > 1500f && femaleRatio > 0.60f -> HindiTtsService.Gender.FEMALE
+                    centroid < 1500f && maleE > femaleE * 1.2f -> HindiTtsService.Gender.MALE
+                    centroid < 1700f && maleE > femaleE * 1.6f -> HindiTtsService.Gender.MALE
                     else -> null  // ambiguous
                 }
 
@@ -161,20 +164,18 @@ object GenderAnalyzer {
                     if (history.size > HIST) history.removeFirst()
 
                     val fCount = history.count { g -> g == HindiTtsService.Gender.FEMALE }
-                    // Require 65% majority before switching
-                    val majority = when {
-                        fCount >= (HIST * 0.65).toInt() -> HindiTtsService.Gender.FEMALE
-                        (history.size - fCount) >= (HIST * 0.65).toInt() -> HindiTtsService.Gender.MALE
-                        else -> null
-                    }
-                    majority?.let { m ->
-                        if (m != HindiTtsService.detectedGender) {
-                            HindiTtsService.detectedGender = m
-                            Log.d(TAG, "Gender → $m (centroid=${centroid.toInt()} femaleRatio=${"%.2f".format(femaleRatio)} rms=${rms.toInt()})")
-                        }
+                    // Switch on simple majority of 3 samples — fast response
+                    val majority: HindiTtsService.Gender = if (fCount > history.size / 2)
+                        HindiTtsService.Gender.FEMALE else HindiTtsService.Gender.MALE
+                    if (majority != HindiTtsService.detectedGender) {
+                        HindiTtsService.detectedGender = majority
+                        // Clear spoken tokens so next sentence replays in new voice
+                        HindiTtsService.spokenTokens.clear()
+                        Log.d(TAG, "Gender → $majority (centroid=${centroid.toInt()} femaleRatio=${"%.2f".format(femaleRatio)} rms=${rms.toInt()})")
+                        CaptionLogger.log(TAG, "Gender switched to $majority")
                     }
                 }
-                delay(100)
+                delay(50)
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
