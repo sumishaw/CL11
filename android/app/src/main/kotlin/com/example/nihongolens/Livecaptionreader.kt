@@ -104,6 +104,9 @@ class LiveCaptionReader : AccessibilityService() {
         startWatchdog()
         startStats()
         CaptionLogger.log(TAG, "=== Connected ===")
+        // Start gender detection — pass lcProjection for headphone-safe internal audio capture
+        // Falls back to mic if projection not yet granted
+        GenderAnalyzer.startMic(MainActivity.lcProjection)
         scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
     }
 
@@ -111,6 +114,7 @@ class LiveCaptionReader : AccessibilityService() {
 
     override fun onDestroy() {
         isRunning = false; instance = null
+        GenderAnalyzer.stop()   // stop mic AudioRecord cleanly
         pendingJob?.cancel()
         watchdogJob?.cancel(); translateJob?.cancel()
         queue.clear(); scope.cancel()
