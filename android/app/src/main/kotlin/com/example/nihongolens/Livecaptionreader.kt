@@ -195,7 +195,7 @@ class LiveCaptionReader : AccessibilityService() {
                 // Stop TTS immediately — video is silent/paused
                 HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
-                sentenceBuffer = ""
+                sentenceBuffer = ""; lastBufferEnqueued = ""
             }
             return null
         }
@@ -219,28 +219,12 @@ class LiveCaptionReader : AccessibilityService() {
         val prev    = lastRawFull
         lastRawFull = full
 
-        // Split full text into sentences — enqueue each new one individually
-        val sentences    = splitSentences(full)
-        val newSentences = sentences.filter { s ->
-            val sn = norm(s)
-            sn.length >= 4 && sn !in lastEnqueuedSents && sn != norm(lastSentText)
-        }
-
-        for (s in newSentences) {
-            val sn = norm(s)
-            lastEnqueuedSents.add(sn)
-            if (lastEnqueuedSents.size > 30)
-                lastEnqueuedSents = lastEnqueuedSents.take(20).toMutableSet()
-            directEnqueue(s)
-        }
-
-        // If no complete sentences found, return new partial content for debounce
-        if (newSentences.isEmpty()) {
-            val newContent = if (prev.isNotEmpty() && full.startsWith(prev))
-                full.substring(prev.length).trim()
-            else full.trim()
-            if (newContent.length >= 4) return newContent
-        }
+        // Return partial content for the sentence buffer in schedule()
+        // Do NOT enqueue directly here — sentence buffer handles complete sentences
+        val newContent = if (prev.isNotEmpty() && full.startsWith(prev))
+            full.substring(prev.length).trim()
+        else full.trim()
+        if (newContent.length >= 4) return newContent
         return null
     }
 
@@ -272,11 +256,30 @@ class LiveCaptionReader : AccessibilityService() {
 
     private fun norm(t: String) = t.trim().replace(Regex("\\s+"), " ")
 
-    // Sentence accumulation — wait for complete sentence before translating
     private var sentenceBuffer      = ""
+    private var lastBufferEnqueued  = ""   // tracks last text actually sent to worker
     private var lastLCChangeMs      = 0L
-    private val SENTENCE_SILENCE_MS = 2_500L  // translate after 2.5s of no new LC text
+    private val SENTENCE_SILENCE_MS = 3_000L
     private var sentenceTimerJob: Job? = null
+
+    private fun shouldEnqueue(text: String): Boolean {
+        val n = norm(text)
+        if (n.isBlank() || n.length < 8) return false
+        val lastN = norm(lastBufferEnqueued)
+        if (n == lastN) return false
+        // Block if new text is just a correction of last (95%+ overlap)
+        // e.g. "I like it" → "I love it" = correction, skip re-read
+        val newWords  = n.split(" ").toSet()
+        val lastWords = lastN.split(" ").toSet()
+        if (lastN.isNotEmpty() && lastWords.isNotEmpty()) {
+            val overlap = newWords.intersect(lastWords).size.toFloat() / newWords.size
+            if (overlap > 0.85f && newWords.size <= lastWords.size + 2) {
+                CaptionLogger.log(TAG, "SKIP correction overlap=${overlap}")
+                return false
+            }
+        }
+        return true
+    }
 
     private fun schedule(text: String) {
         val script = detectScript(text)
@@ -286,7 +289,7 @@ class LiveCaptionReader : AccessibilityService() {
                     CaptionLogger.log(TAG, "LANG $confirmedLang→$script")
                     confirmedLang = script; pendingLang = ""; pendingCount = 0
                     lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
-                    sentenceBuffer = ""
+                    sentenceBuffer = ""; lastBufferEnqueued = ""
                     queue.clear(); expectedSeq = seqCounter.get() + 1
                 }
             } else { pendingLang = script; pendingCount = 1 }
@@ -295,7 +298,7 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceBuffer = text
         lastLCChangeMs = System.currentTimeMillis()
 
-        // TRIGGER 1: sentence-ending punctuation → translate after brief settle
+        // Trigger on sentence-ending punctuation
         val trimmed = text.trim()
         val endsWithPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
                             trimmed.endsWith("!") || trimmed.endsWith("。") ||
@@ -305,8 +308,9 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel()
             pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(200)  // brief settle for LC corrections
-                if (sentenceBuffer.isNotBlank()) {
+                delay(400)   // wait for LC to finish correcting last word
+                if (sentenceBuffer.isNotBlank() && shouldEnqueue(sentenceBuffer)) {
+                    lastBufferEnqueued = sentenceBuffer
                     enqueue(sentenceBuffer)
                     sentenceBuffer = ""
                 }
@@ -314,20 +318,17 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // TRIGGER 2: silence — LC stopped updating for 3s
-        // Only reset timer when text actually grows (new words added)
+        // Silence trigger — LC stopped updating
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            if (sentenceBuffer.isNotBlank()) {
-                CaptionLogger.log(TAG, "SILENCE translate after ${SENTENCE_SILENCE_MS}ms")
+            if (sentenceBuffer.isNotBlank() && shouldEnqueue(sentenceBuffer)) {
+                CaptionLogger.log(TAG, "SILENCE translate")
+                lastBufferEnqueued = sentenceBuffer
                 enqueue(sentenceBuffer)
                 sentenceBuffer = ""
             }
         }
-
-        // NOTE: removed 600ms debounce — it was firing mid-sentence causing partial translations
-        // Only punct + silence triggers are used now
         pendingJob?.cancel()
     }
 
@@ -434,6 +435,8 @@ class LiveCaptionReader : AccessibilityService() {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
+                // Update gender from source text pronouns (works for all languages)
+                HindiTtsService.updateGenderFromSource(text, serverLang.ifBlank { confirmedLang })
                 HindiTtsService.speak(hindi)
             }
         }
