@@ -4,44 +4,50 @@ import android.util.Log
 import kotlin.math.*
 
 /**
- * GenderAnalyzer — detects speaker gender from PCM audio fed by SpeechCaptureService.
+ * GenderAnalyzer v3 — YIN pitch detection on PCM fed by SpeechCaptureService.
  *
- * Architecture (v2 — shared PCM):
- *   Android only allows ONE AudioPlaybackCaptureConfiguration per MediaProjection.
- *   SpeechCaptureService owns the AudioRecord. After each raw read it calls
- *   GenderAnalyzer.feedPcm(bytes, count) directly — no second AudioRecord needed.
+ * WHY YIN INSTEAD OF FFT CENTROID:
+ *   Spectral centroid is dominated by room acoustics, background noise, and bass
+ *   frequencies that have nothing to do with the speaker's voice. In a conference
+ *   video with applause, music, and multiple speakers the centroid is almost always
+ *   pulled into the male range regardless of who is speaking.
  *
- * Method: spectral centroid + F0 band energy ratio on 2048-sample FFT windows.
- *   Female speakers: F0 165-300Hz, spectral centroid > 1600Hz
- *   Male speakers:   F0  80-165Hz, spectral centroid < 1600Hz
+ *   YIN (de Cheveigné & Kawahara 2002) finds the actual fundamental frequency (F0)
+ *   of the dominant periodic signal — i.e. the current speaker's pitch — ignoring
+ *   aperiodic noise. It is the industry standard for monophonic pitch detection and
+ *   works robustly on real-world mixed audio.
  *
- * Smoothed over 3 windows (~150ms). Updates HindiTtsService.detectedGender.
- * Skips analysis during TTS playback to avoid detecting own voice.
+ *   F0 < 165 Hz → male voice
+ *   F0 ≥ 165 Hz → female voice
+ *
+ * Architecture:
+ *   SpeechCaptureService feeds raw PCM bytes via feedPcm().
+ *   No second AudioRecord needed — shares the existing capture stream.
  */
 object GenderAnalyzer {
 
     private const val TAG  = "GenderAnalyzer"
-    private const val SR   = 16_000
-    private const val N    = 2048            // FFT window size — 128ms at 16kHz
-    private const val HIST = 3               // history depth — switch on 2/3 majority
+    private const val SR   = 16_000      // sample rate (matches SpeechCaptureService)
+    private const val WIN  = 2048        // YIN window — 128ms at 16kHz
+    private const val TAU_MIN = (SR / 300.0).toInt()   // 300 Hz upper limit  = 53 samples
+    private const val TAU_MAX = (SR / 60.0).toInt()    // 60 Hz  lower limit  = 266 samples
+    private const val YIN_THRESHOLD = 0.15f             // lower = stricter pitch confidence
+    private const val HIST = 5           // vote history — switch on 3/5 majority
+    private const val RMS_FLOOR = 200.0  // skip very quiet frames (silence / noise)
 
     @Volatile var enabled = false
 
-    private val history = ArrayDeque<HindiTtsService.Gender>()
-
-    // Accumulation buffer — filled from raw readBuf bytes fed by SpeechCaptureService
-    private val accum     = ShortArray(N)
+    private val history   = ArrayDeque<HindiTtsService.Gender>()
+    private val accum     = ShortArray(WIN)
     private var accumFill = 0
 
-    // Reusable FFT arrays
-    private val re  = FloatArray(N)
-    private val im  = FloatArray(N)
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     fun start() {
         enabled = true
         history.clear()
         accumFill = 0
-        Log.d(TAG, "GenderAnalyzer started (PCM-feed mode)")
+        Log.d(TAG, "GenderAnalyzer started (YIN pitch detection)")
         CaptionLogger.log(TAG, "started")
     }
 
@@ -52,84 +58,92 @@ object GenderAnalyzer {
         Log.d(TAG, "GenderAnalyzer stopped")
     }
 
+    // ── PCM feed ──────────────────────────────────────────────────────────────
+
     /**
      * Called by SpeechCaptureService on every raw AudioRecord.read().
-     * bytes: raw PCM 16-bit LE mono, count: number of valid bytes read.
-     * Runs on the AudioCaptureThread — must be fast (no I/O, no blocking).
+     * bytes: raw PCM 16-bit LE mono. count: valid byte count.
+     * Runs on AudioCaptureThread — no I/O, no blocking.
      */
     fun feedPcm(bytes: ByteArray, count: Int) {
         if (!enabled) return
-        // Skip during TTS playback — avoid analyzing own Hindi voice
         if (HindiTtsService.isSuppressed()) { accumFill = 0; return }
 
-        // Convert bytes → shorts and fill accumulator
         var i = 0
-        while (i + 1 < count && accumFill < N) {
-            val lo = bytes[i].toInt() and 0xFF
-            val hi = bytes[i + 1].toInt()
-            accum[accumFill++] = ((hi shl 8) or lo).toShort()
+        while (i + 1 < count) {
+            if (accumFill < WIN) {
+                val lo = bytes[i].toInt() and 0xFF
+                val hi = bytes[i + 1].toInt() and 0xFF
+                accum[accumFill++] = ((hi shl 8) or lo).toShort()
+            }
             i += 2
-        }
-
-        if (accumFill >= N) {
-            analyze()
-            accumFill = 0
+            if (accumFill >= WIN) {
+                analyze()
+                accumFill = 0
+            }
         }
     }
 
+    // ── YIN pitch detection ───────────────────────────────────────────────────
+
     private fun analyze() {
-        // RMS — skip silence / very quiet audio
+        // RMS check — skip silence and near-silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
-        val rms = sqrt(energy / N)
-        if (rms < 30.0) return
+        val rms = sqrt(energy / WIN)
+        if (rms < RMS_FLOOR) return
 
-        // Hann window + load into FFT arrays
-        for (i in 0 until N) {
-            val w = 0.5f * (1f - cos(2.0 * PI * i / (N - 1)).toFloat())
-            re[i] = accum[i] * w / 32768f
-            im[i] = 0f
+        // Normalize to float [-1, 1]
+        val x = FloatArray(WIN) { accum[it] / 32768f }
+
+        // Step 1 — difference function d(tau)
+        // d(tau) = sum_{j=0}^{W-tau-1} (x[j] - x[j+tau])^2
+        val d = FloatArray(TAU_MAX + 1)
+        val halfWin = WIN / 2
+        for (tau in 1..TAU_MAX) {
+            var sum = 0.0f
+            for (j in 0 until halfWin) {
+                val diff = x[j] - x[j + tau]
+                sum += diff * diff
+            }
+            d[tau] = sum
         }
 
-        fft(re, im, N)
-
-        // Magnitude spectrum
-        val mag = FloatArray(N / 2) { b -> sqrt(re[b] * re[b] + im[b] * im[b]) }
-
-        // Spectral centroid over speech range 200–4000 Hz
-        val speechLo = (200f * N / SR).toInt()
-        val speechHi = (4000f * N / SR).toInt().coerceAtMost(N / 2 - 1)
-        var wSum = 0.0; var eSum = 0.0
-        for (b in speechLo..speechHi) {
-            wSum += b.toDouble() * SR / N * mag[b]
-            eSum += mag[b]
-        }
-        val centroid = if (eSum < 1e-4) 0f else (wSum / eSum).toFloat()
-
-        // F0 band energy (80–165 Hz male, 165–300 Hz female)
-        val maleLo   = (80f  * N / SR).toInt()
-        val maleHi   = (165f * N / SR).toInt()
-        val femaleLo = (165f * N / SR).toInt()
-        val femaleHi = (300f * N / SR).toInt()
-        val maleE    = (maleLo..maleHi).sumOf   { mag[it].toDouble() }.toFloat()
-        val femaleE  = (femaleLo..femaleHi).sumOf { mag[it].toDouble() }.toFloat()
-        val totalE   = maleE + femaleE + 1e-6f
-        val femaleRatio = femaleE / totalE
-
-        // Gender decision — widened female thresholds
-        // Use ?: return so detected is smart-cast to non-null Gender
-        val detected: HindiTtsService.Gender = when {
-            centroid > 1800f && femaleRatio > 0.40f -> HindiTtsService.Gender.FEMALE
-            centroid > 1600f && femaleRatio > 0.50f -> HindiTtsService.Gender.FEMALE
-            centroid > 1500f && femaleRatio > 0.60f -> HindiTtsService.Gender.FEMALE
-            centroid < 1500f && maleE > femaleE * 1.2f -> HindiTtsService.Gender.MALE
-            centroid < 1700f && maleE > femaleE * 1.6f -> HindiTtsService.Gender.MALE
-            else -> return  // ambiguous frame — skip
+        // Step 2 — cumulative mean normalized difference function (CMNDF)
+        val cmndf = FloatArray(TAU_MAX + 1)
+        cmndf[0] = 1f
+        var runSum = 0f
+        for (tau in 1..TAU_MAX) {
+            runSum += d[tau]
+            cmndf[tau] = if (runSum > 0f) d[tau] * tau / runSum else 1f
         }
 
-        history.addLast(detected)
+        // Step 3 — find first dip below threshold in valid range
+        var tau = TAU_MIN
+        while (tau < TAU_MAX - 1) {
+            if (cmndf[tau] < YIN_THRESHOLD) {
+                // Step 4 — parabolic interpolation for sub-sample precision
+                val better = if (tau + 1 < TAU_MAX && cmndf[tau + 1] < cmndf[tau])
+                    tau + 1 else tau
+                val f0 = SR.toFloat() / better
+                classifyPitch(f0, rms)
+                return
+            }
+            tau++
+        }
+        // No confident pitch found — frame is unvoiced (noise/silence/music)
+        // Don't vote — let history hold its current state
+    }
+
+    private fun classifyPitch(f0: Float, rms: Float) {
+        // Hard boundary at 165 Hz (standard male/female divide)
+        val gender = if (f0 >= 165f) HindiTtsService.Gender.FEMALE
+                     else             HindiTtsService.Gender.MALE
+
+        history.addLast(gender)
         if (history.size > HIST) history.removeFirst()
 
+        // Need 3/5 majority to switch — avoids flip-flopping on ambiguous frames
         val fCount   = history.count { it == HindiTtsService.Gender.FEMALE }
         val majority = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
                        else HindiTtsService.Gender.MALE
@@ -137,43 +151,8 @@ object GenderAnalyzer {
         if (majority != HindiTtsService.detectedGender) {
             HindiTtsService.detectedGender = majority
             HindiTtsService.spokenTokens.clear()
-            Log.d(TAG, "Gender(audio)→$majority centroid=${centroid.toInt()} femaleRatio=${"%.2f".format(femaleRatio)} rms=${rms.toInt()}")
-            CaptionLogger.log(TAG, "Gender→$majority (c=${centroid.toInt()} fr=${"%.2f".format(femaleRatio)})")
-        }
-    }
-
-    // ── Cooley-Tukey radix-2 in-place FFT ────────────────────────────────────
-
-    private fun fft(re: FloatArray, im: FloatArray, n: Int) {
-        var j = 0
-        for (i in 1 until n) {
-            var bit = n shr 1
-            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
-            j = j xor bit
-            if (i < j) {
-                re[i] = re[j].also { re[j] = re[i] }
-                im[i] = im[j].also { im[j] = im[i] }
-            }
-        }
-        var len = 2
-        while (len <= n) {
-            val ang = -2.0 * PI / len
-            val wRe = cos(ang).toFloat(); val wIm = sin(ang).toFloat()
-            var i = 0
-            while (i < n) {
-                var uRe = 1f; var uIm = 0f
-                for (k in 0 until len / 2) {
-                    val tRe = uRe * re[i+k+len/2] - uIm * im[i+k+len/2]
-                    val tIm = uRe * im[i+k+len/2] + uIm * re[i+k+len/2]
-                    re[i+k+len/2] = re[i+k] - tRe
-                    im[i+k+len/2] = im[i+k] - tIm
-                    re[i+k] += tRe; im[i+k] += tIm
-                    val nRe = uRe * wRe - uIm * wIm
-                    uIm = uRe * wIm + uIm * wRe; uRe = nRe
-                }
-                i += len
-            }
-            len = len shl 1
+            Log.d(TAG, "Gender→$majority F0=${f0.toInt()}Hz rms=${rms.toInt()}")
+            CaptionLogger.log(TAG, "Gender→$majority F0=${f0.toInt()}Hz")
         }
     }
 }
