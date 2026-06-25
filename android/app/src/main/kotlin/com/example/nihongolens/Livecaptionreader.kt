@@ -34,7 +34,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
-        private const val QUEUE_CAP        = 5
+        private const val QUEUE_CAP        = 2   // keep queue short — drop old when whisper is slow
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -104,11 +104,9 @@ class LiveCaptionReader : AccessibilityService() {
         startWatchdog()
         startStats()
         CaptionLogger.log(TAG, "=== Connected ===")
-        // Start dedicated USAGE_MEDIA capture for gender detection
-        // lcProjection may be null if user hasn't granted screen capture yet —
-        // in that case GenderAnalyzer logs and waits; call start() again from MainActivity
-        // when REQ_GENDER_PROJECTION is granted
-        GenderAnalyzer.start(MainActivity.lcProjection)
+        // Start gender detection — pass lcProjection for headphone-safe internal audio capture
+        // Falls back to mic if projection not yet granted
+        GenderAnalyzer.startMic(MainActivity.lcProjection)
         scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
     }
 
@@ -116,7 +114,7 @@ class LiveCaptionReader : AccessibilityService() {
 
     override fun onDestroy() {
         isRunning = false; instance = null
-        GenderAnalyzer.stop()   // stop dedicated capture cleanly
+        GenderAnalyzer.stop()   // stop mic AudioRecord cleanly
         pendingJob?.cancel()
         watchdogJob?.cancel(); translateJob?.cancel()
         queue.clear(); scope.cancel()
@@ -444,6 +442,12 @@ class LiveCaptionReader : AccessibilityService() {
                 lastSentText = text
                 val result = callServer(text)
                 val ms     = System.currentTimeMillis() - t0
+
+                // Drop if translation took >8s AND newer captions have arrived (stale)
+                if (ms > 8_000L && seq < expectedSeq) {
+                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
+                    continue
+                }
 
                 if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
 
