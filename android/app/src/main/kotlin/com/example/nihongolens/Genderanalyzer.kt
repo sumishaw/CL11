@@ -114,7 +114,7 @@ object GenderAnalyzer {
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
-        genderHistory.clear(); emotionHistory.clear()
+        genderHistory.clear(); emotionHistory.clear(); sustainedFrames = 0; lastStableF0 = 0f
         accumFill = 0; maleF0Base = 0f; femaleF0Base = 0f
         if (lastStatus != "waiting for screen capture permission")
             CaptionLogger.log(TAG, "stopped")
@@ -293,6 +293,14 @@ ingest(buf, n)
 
         // ── F0 JITTER (roughness) ─────────────────────────────────────────────
         f0Ring[f0RingIdx % f0Ring.size] = f0; f0RingIdx++
+
+        // Sustained note detection: count frames where F0 stays within ±5%
+        if (lastStableF0 > 0f && abs(f0 - lastStableF0) / lastStableF0 < 0.05f) {
+            sustainedFrames++
+        } else {
+            sustainedFrames = 0
+            lastStableF0 = f0
+        }
         val validF0  = f0Ring.filter { it > 0f }
         val f0Mean   = if (validF0.isEmpty()) f0 else validF0.average().toFloat()
         val roughness = if (validF0.size < 2) 0.05f else
@@ -315,6 +323,12 @@ ingest(buf, n)
 
         // ── EMOTION DETECTION ─────────────────────────────────────────────────
         val emotion: HindiTtsService.Emotion = when {
+            // SINGING: sustained note — very harmonic (high HNR), stable F0 (low jitter),
+            // held for 5+ consecutive analysis frames (~640ms)
+            hnr > 0.75f && roughness < 0.04f && rmsNorm in 0.3f..2.0f
+                && sustainedFrames >= 5 ->
+                HindiTtsService.Emotion.SINGING
+
             f0Slope > 0.20f && rmsNorm > 2.0f && roughness > 0.18f     -> HindiTtsService.Emotion.GASPING
             roughness > 0.22f && rmsNorm > 1.8f && f0 > f0Mean * 1.02f -> HindiTtsService.Emotion.PANTING
             f0 < f0Mean * 0.85f && roughness < 0.06f && rmsNorm in 0.3f..1.0f && hnr > 0.4f -> HindiTtsService.Emotion.MOANING
