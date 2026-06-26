@@ -2,8 +2,10 @@ package com.example.nihongolens
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.Log
@@ -89,6 +91,19 @@ object GenderAnalyzer {
     private var captureJob:    Job?         = null
     private var captureRec:    AudioRecord? = null
 
+    // ── Background audio pass-through ─────────────────────────────────────────
+    // Plays captured media audio (music, applause, ambient) at reduced volume
+    // alongside Hindi TTS on a dedicated AudioTrack channel.
+    // Automatically ducks when TTS speaks, restores when TTS finishes.
+    private var bgTrack:       AudioTrack? = null
+    private var bgVolume       = 0.35f     // normal BG volume (35%)
+    private var bgDucked       = false
+
+    companion object {
+        const val BG_VOLUME_NORMAL = 0.35f   // background when no TTS
+        const val BG_VOLUME_DUCKED = 0.10f   // background during TTS speech
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     fun start(projection: MediaProjection? = null) {
@@ -109,6 +124,8 @@ object GenderAnalyzer {
         captureJob?.cancel(); captureJob = null
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
+        try { bgTrack?.stop(); bgTrack?.release() } catch (_: Exception) {}
+        bgTrack = null
         captureRec = null
         genderHistory.clear(); emotionHistory.clear()
         accumFill = 0; maleF0Base = 0f; femaleF0Base = 0f
@@ -158,18 +175,54 @@ object GenderAnalyzer {
         rec.startRecording()
         CaptionLogger.log(TAG, ">>> VOICE PROFILE CAPTURE STARTED SR=${SR}Hz <<<")
 
+        // Initialise background AudioTrack — plays media audio at reduced volume
+        // Uses USAGE_ASSISTANT so Android routes it correctly alongside TTS
+        val bgBufSize = AudioTrack.getMinBufferSize(
+            SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(WIN * 4)
+        bgTrack = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build())
+                .setAudioFormat(AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SR)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build())
+                .setBufferSizeInBytes(bgBufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build().also { track ->
+                    track.setVolume(BG_VOLUME_NORMAL)
+                    track.play()
+                    CaptionLogger.log(TAG, "BG AudioTrack started SR=$SR vol=$BG_VOLUME_NORMAL")
+                }
+        } catch (e: Exception) {
+            CaptionLogger.log(TAG, "BG AudioTrack failed: ${e.message}")
+            null
+        }
+
         val buf = ByteArray(WIN * 2); var reads = 0
         try {
             while (currentCoroutineContext().isActive && enabled) {
                 val n = rec.read(buf, 0, buf.size)
                 when {
-                    n > 0 -> { reads++; if (reads == 1) CaptionLogger.log(TAG, "FIRST read — media audio flowing!"); ingest(buf, n) }
+                    n > 0 -> {
+                        reads++
+                        if (reads == 1) CaptionLogger.log(TAG, "FIRST read — media audio flowing!")
+                        // Write raw PCM to background track (media audio pass-through)
+                        // This preserves music, applause, ambient sounds
+                        bgTrack?.write(buf, 0, n)
+                        ingest(buf, n)
+                    }
                     n < 0 -> { CaptionLogger.log(TAG, "read error=$n"); break }
                 }
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
-            captureRec = null; enabled = false
+            try { bgTrack?.stop(); bgTrack?.release() } catch (_: Exception) {}
+            bgTrack = null; captureRec = null; enabled = false
         }
     }
 
@@ -371,5 +424,24 @@ object GenderAnalyzer {
         volumeBuf[i] = vol
         breathBuf[i] = breath
         roughBuf[i]  = rough
+    }
+
+    private fun Float.format() = String.format("%.2f", this)
+
+    // ── Background audio ducking API ─────────────────────────────────────────
+    // Called by HindiTtsService to duck BG during speech and restore after
+
+    fun duckBackground() {
+        if (bgDucked) return
+        bgDucked = true
+        bgTrack?.setVolume(BG_VOLUME_DUCKED)
+        CaptionLogger.log("GenderAnalyzer", "BG ducked to $BG_VOLUME_DUCKED")
+    }
+
+    fun unduckBackground() {
+        if (!bgDucked) return
+        bgDucked = false
+        bgTrack?.setVolume(BG_VOLUME_NORMAL)
+        CaptionLogger.log("GenderAnalyzer", "BG restored to $BG_VOLUME_NORMAL")
     }
 }
