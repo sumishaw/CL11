@@ -468,7 +468,8 @@ class LiveCaptionReader : AccessibilityService() {
                 val text = item.text
                 val ageMs = System.currentTimeMillis() - item.enqMs
 
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
+                // Note: seq < expectedSeq check removed for 2-worker mode
+                // Both workers deliver results; TTS queue handles ordering
                 // Drop sentences that waited too long — speaker has moved on
                 if (ageMs > 15_000L) {
                     CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
@@ -480,13 +481,11 @@ class LiveCaptionReader : AccessibilityService() {
                 val result = callServer(text)
                 val ms     = System.currentTimeMillis() - t0
 
-                // Drop if translation took >8s AND newer captions have arrived (stale)
-                if (ms > 8_000L && seq < expectedSeq) {
-                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
+                // Only drop if truly too slow (>10s) — don't discard parallel worker results
+                if (ms > 10_000L) {
+                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms")
                     continue
                 }
-
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
 
                 if (result == null) {
                     errCount.incrementAndGet()
