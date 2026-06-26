@@ -9,6 +9,9 @@ import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlin.math.*
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * GenderAnalyzer v10 — Full Voice Profile extraction from USAGE_MEDIA internal audio.
@@ -91,9 +94,14 @@ object GenderAnalyzer {
     private var captureJob:    Job?         = null
     private var captureRec:    AudioRecord? = null
 
-    // Background audio: Android AudioManager naturally mixes USAGE_MEDIA (video)
-    // and USAGE_ASSISTANT (Hindi TTS) — no loopback AudioTrack needed.
-    private var bgDucked = false
+    // ── Background audio streaming to TTS server ─────────────────────────────
+    // Every 256ms we POST raw PCM to /bg_audio on the TTS server.
+    // The server mixes it (at 25% volume) into every TTS WAV it synthesises.
+    // This bakes background music INTO the TTS audio — no Android ducking.
+    private var bgDucked       = false
+    private val BG_SERVER_URL  = "http://127.0.0.1:8766/bg_audio"
+    private val bgFrameCounter = AtomicInteger(0)  // send every 2nd WIN (256ms)
+    private var bgSendJob:     Job? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -113,6 +121,7 @@ object GenderAnalyzer {
     fun stop() {
         enabled = false
         captureJob?.cancel(); captureJob = null
+        bgSendJob?.cancel(); bgSendJob = null
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
@@ -358,7 +367,7 @@ ingest(buf, n)
         }
 
         emotionHistory.addLast(emotion)
-        if (emotionHistory.size > 7) emotionHistory.removeFirst()
+        if (emotionHistory.size > 3) emotionHistory.removeFirst()  // 3-frame window = 384ms
         val smoothedEmotion = emotionHistory.groupingBy { it }.eachCount()
             .maxByOrNull { it.value }?.key ?: HindiTtsService.Emotion.NEUTRAL
 
@@ -401,6 +410,26 @@ ingest(buf, n)
     }
 
     private fun Float.format() = String.format("%.2f", this)
+
+    // ── Background audio streaming ───────────────────────────────────────────
+
+    /** POST raw 16kHz mono PCM to TTS server's rolling background buffer. */
+    private fun sendBgAudio(pcm: ByteArray) {
+        try {
+            val conn = URL(BG_SERVER_URL).openConnection() as HttpURLConnection
+            conn.requestMethod        = "POST"
+            conn.doOutput             = true
+            conn.connectTimeout       = 200   // fast — don't block if server busy
+            conn.readTimeout          = 200
+            conn.setRequestProperty("Content-Type", "application/octet-stream")
+            conn.setRequestProperty("Content-Length", pcm.size.toString())
+            conn.outputStream.use { it.write(pcm) }
+            conn.responseCode         // trigger send
+            conn.disconnect()
+        } catch (_: Exception) {
+            // Silent — BG streaming is best-effort, never blocks TTS
+        }
+    }
 
     // ── Background audio (Android handles mixing automatically) ──────────────
     // USAGE_MEDIA (video) and USAGE_ASSISTANT (TTS) are mixed by Android AudioManager.
