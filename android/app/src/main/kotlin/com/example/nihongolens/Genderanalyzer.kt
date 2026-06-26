@@ -448,10 +448,6 @@ object GenderAnalyzer {
 
     private fun Float.format() = String.format("%.2f", this)
 
-    // ── Background audio streaming ───────────────────────────────────────────
-
-            conn.responseCode         // trigger send
-            conn.disconnect()
     // ── Background audio (Android handles mixing automatically) ──────────────
     // USAGE_MEDIA (video) and USAGE_ASSISTANT (TTS) are mixed by Android AudioManager.
     // No manual ducking needed — AudioFocus system handles volume balance.
