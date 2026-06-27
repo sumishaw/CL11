@@ -78,6 +78,12 @@ object HindiTtsService {
     private var cacheDir: File? = null
     private var am: AudioManager? = null
 
+    // Selected voices: Voice II (female) and Voice IV (male) from Hindi (India) voices list
+    // Discovered at init time by enumerating tts.voices filtered to hi-IN locale
+    // User picked Voice II for female and Voice IV for male (from Settings screenshot)
+    @Volatile private var voiceFemale: android.speech.tts.Voice? = null
+    @Volatile private var voiceMale:   android.speech.tts.Voice? = null
+
     // Pending utterance callbacks: utteranceId → resumption function
     private val pendingUtterances = ConcurrentHashMap<String, () -> Unit>()
 
@@ -108,17 +114,44 @@ object HindiTtsService {
             am?.allowedCapturePolicy = AudioAttributes.ALLOW_CAPTURE_BY_NONE
         }
 
-        // Initialize Android TTS with hi-IN locale
+        // Initialize Android TTS — discover hi-IN voices and select Voice II (female) / Voice IV (male)
         tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
+                // Enumerate all available hi-IN voices, sorted alphabetically (matches Settings order)
+                val hiVoices = tts?.voices
+                    ?.filter { v ->
+                        (v.locale.language == "hi" || v.locale.toLanguageTag().startsWith("hi")) &&
+                        !v.isNetworkConnectionRequired
+                    }
+                    ?.sortedBy { it.name }
+                    ?: emptyList()
+
+                CaptionLogger.log(TAG, "hi-IN voices found: ${hiVoices.size}")
+                hiVoices.forEachIndexed { i, v ->
+                    CaptionLogger.log(TAG, "  Voice ${i+1}: ${v.name} quality=${v.quality}")
+                }
+
+                // User confirmed: Voice II = female (index 1), Voice IV = male (index 3)
+                // Indices are 0-based in the sorted list
+                voiceFemale = hiVoices.getOrNull(1)  // Voice II
+                voiceMale   = hiVoices.getOrNull(3)  // Voice IV
+
+                // Fallback: if fewer than 4 voices, use what's available
+                if (voiceFemale == null && hiVoices.isNotEmpty())
+                    voiceFemale = hiVoices.getOrNull(0)
+                if (voiceMale == null && hiVoices.size >= 2)
+                    voiceMale = hiVoices.getOrNull(1)
+                    ?: voiceFemale  // last resort: same voice, different pitch
+
+                CaptionLogger.log(TAG, "FEMALE voice: ${voiceFemale?.name ?: "not found"}")
+                CaptionLogger.log(TAG, "MALE voice:   ${voiceMale?.name ?: "not found"}")
+
+                // Set default locale as fallback
                 val result = tts?.setLanguage(Locale("hi", "IN"))
                 if (result == TextToSpeech.LANG_MISSING_DATA ||
                     result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    // Fallback to generic Hindi
                     tts?.setLanguage(Locale("hi"))
                     CaptionLogger.log(TAG, "TTS: hi-IN not found, using generic hi")
-                } else {
-                    CaptionLogger.log(TAG, "TTS: hi-IN ready")
                 }
 
                 // Set audio attributes to USAGE_ASSISTANT (excluded from LC capture)
@@ -131,14 +164,10 @@ object HindiTtsService {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
-                        utteranceId?.let { id ->
-                            pendingUtterances.remove(id)?.invoke()
-                        }
+                        utteranceId?.let { id -> pendingUtterances.remove(id)?.invoke() }
                     }
                     override fun onError(utteranceId: String?) {
-                        utteranceId?.let { id ->
-                            pendingUtterances.remove(id)?.invoke()
-                        }
+                        utteranceId?.let { id -> pendingUtterances.remove(id)?.invoke() }
                     }
                 })
 
@@ -201,7 +230,12 @@ object HindiTtsService {
 
         // Emotion → pitch/rate adjustments
         val (pitchMult, rateMult) = emotionPitchRate(currentEmotion)
-        val basePitch = if (isFemale) 1.15f else 0.88f
+        // When specific voices (Voice II/IV) are available, they handle gender identity.
+        // BasePitch = 1.0 (neutral) so emotion pitch applies cleanly on top.
+        // If no specific voice found (voiceFemale/voiceMale null), use pitch to approximate gender.
+        val hasSpecificVoice = if (isFemale) voiceFemale != null else voiceMale != null
+        val basePitch = if (hasSpecificVoice) 1.0f
+                        else if (isFemale) 1.15f else 0.88f
         val finalPitch = (basePitch * pitchMult).coerceIn(0.5f, 2.0f)
         val finalRate  = (ttsSpeedMultiplier * rateMult).coerceIn(0.5f, 3.0f)
 
@@ -350,7 +384,22 @@ object HindiTtsService {
             val localTts = tts ?: return@withContext null
             val outFile = File(cacheDir, "tts_${UUID.randomUUID()}.wav")
 
-            // Set voice parameters
+            // GENDER SWITCH FIX: Set the actual voice object (Voice II or Voice IV)
+            // Previously only used setPitch() which doesn't change the voice identity —
+            // it was always the same default voice with a pitch shift = still sounds male.
+            // Now: voiceFemale = Voice II, voiceMale = Voice IV (user-confirmed mapping)
+            val isFemale = item.gender == "female"
+            val targetVoice = if (isFemale) voiceFemale else voiceMale
+            if (targetVoice != null) {
+                localTts.voice = targetVoice
+                CaptionLogger.log(TAG, "TTS voice=${targetVoice.name} gender=${item.gender}")
+            } else {
+                // Fallback: use pitch to approximate gender difference
+                CaptionLogger.log(TAG, "TTS no specific voice found, using pitch=${item.pitch}")
+            }
+
+            // Set emotion-based pitch and rate ON TOP of voice identity
+            // Voice identity = who speaks; pitch/rate = how they feel
             localTts.setSpeechRate(item.rate)
             localTts.setPitch(item.pitch)
 
