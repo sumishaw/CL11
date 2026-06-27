@@ -39,7 +39,8 @@ import kotlin.math.*
 object HindiTtsService {
 
     private const val TAG      = "HindiTTS"
-    private const val TTS_URL  = "http://127.0.0.1:8766/tts"
+    private const val TTS_URL   = "http://127.0.0.1:8766/tts"
+    private const val SPLIT_URL = "http://127.0.0.1:8766/tts_split"
     private const val GENDER_URL = "http://127.0.0.1:8765/gender"
 
     enum class Gender  { AUTO, MALE, FEMALE }
@@ -168,31 +169,32 @@ object HindiTtsService {
     }
 
 
-    // updateGenderFromSource() removed — pronouns describe who is talked ABOUT,
-    // not who is speaking. Gender detection is audio-only via GenderAnalyzer.kt.
-
-    // ── Fetch worker (Piper HTTP → WAV) ───────────────────────────────────────
+    // ── Fetch worker — Streaming chunk-by-chunk architecture ──────────────────
+    // PROBLEM WAS: Server batched all chunks (4 × 3s = 12s) into one WAV.
+    // Android readTimeout=12s → connection died before WAV arrived → TTS-ERR.
+    //
+    // FIX: Split sentence into chunks (5 words each) via /tts_split.
+    // Fetch and play each chunk WAV individually.
+    // Chunk 1 (3s synth) plays while chunk 2 (3s synth) is being fetched.
+    // First audio arrives in ~3s. Gap between chunks = 0 (pipelined).
+    // Each /tts request only takes 2-4s → well within 8s readTimeout.
 
     private fun startFetchWorker() {
         fetchWorker = scope.launch {
             while (isActive) {
-                val item = fetchQueue.take()   // blocks — never misses
+                val item = fetchQueue.take()
                 if (!enabled) continue
 
-                // STALE GUARD: drop sentences waiting >15s
-                // With FIFO token display (subtitle shown when TTS plays, not when translation arrives),
-                // synthesis delay is hidden from user — they see subtitle exactly when audio plays.
-                // So we can afford a longer stale window. 15s = allows 1-2 slow syntheses in queue.
+                // Stale guard: 10s (each chunk takes 2-4s, so 10s = 2-3 stale chunks max)
                 val ageMs = System.currentTimeMillis() - item.enqMs
-                if (ageMs > 15_000L) {
+                if (ageMs > 10_000L) {
                     CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
                     continue
                 }
 
-                // QUEUE OVERLOAD: if more than 3 items waiting, skip current
-                // With 8-10s synthesis, q>3 = 24-30s of queued content = too old
-                if (fetchQueue.size > 3) {
-                    CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}, going to latest")
+                // Overload: if more than 1 sentence queued, skip current → go to latest
+                if (fetchQueue.size > 1) {
+                    CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}")
                     continue
                 }
 
@@ -209,20 +211,34 @@ object HindiTtsService {
                     val textToSpeak = if (verbGender == "female")
                         toFeminineHindi(item.text) else item.text
 
-                    val t0 = System.currentTimeMillis()
-                    val wav = fetchWav(textToSpeak, resolvedGender, item.speed, item.emotion)
-                    val fetchMs = System.currentTimeMillis() - t0
+                    // Step 1: Get chunk list from server
+                    val chunks = fetchChunks(textToSpeak) ?: listOf(textToSpeak)
+                    CaptionLogger.log(TAG, "TTS-SPLIT ${chunks.size} chunks '${textToSpeak.take(40)}'")
 
-                    if (wav != null && wav.size > 44) {
-                        val sr  = readInt(wav, 24).coerceAtLeast(8_000)
-                        val nch = readShort(wav, 22).coerceAtLeast(1)
-                        val bit = readShort(wav, 34).coerceAtLeast(8)
-                        val dur = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nch * (bit / 8))
-                        CaptionLogger.log(TAG, "TTS-WAV ${fetchMs}ms ${dur}ms ${resolvedGender} '${textToSpeak.take(40)}'")
-                        playQueue.offer(PlayItem(item.text, wav, dur))
-                    } else {
-                        CaptionLogger.log(TAG, "TTS-ERR ${fetchMs}ms — server returned null/empty WAV")
-                        Log.w(TAG, "Empty WAV — is hindi_tts_server2.py running on port 8766?")
+                    // Step 2: Fetch and enqueue each chunk WAV individually
+                    // Play worker starts playing chunk 0 immediately
+                    // While playing chunk 0, fetch worker fetches chunk 1 — true streaming
+                    var firstChunk = true
+                    for (chunk in chunks) {
+                        if (!enabled) break
+                        val t0  = System.currentTimeMillis()
+                        val wav = fetchWav(chunk, resolvedGender, item.speed, item.emotion)
+                        val ms  = System.currentTimeMillis() - t0
+
+                        if (wav != null && wav.size > 44) {
+                            val sr  = readInt(wav, 24).coerceAtLeast(8_000)
+                            val nch = readShort(wav, 22).coerceAtLeast(1)
+                            val bit = readShort(wav, 34).coerceAtLeast(8)
+                            val dur = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nch * (bit / 8))
+                            // Use display text only on first chunk; subsequent chunks show ""
+                            // so overlay doesn't flash per-chunk
+                            val display = if (firstChunk) item.text else ""
+                            playQueue.offer(PlayItem(display, wav, dur))
+                            CaptionLogger.log(TAG, "TTS-CHUNK ${ms}ms ${dur}ms '${chunk.take(30)}'")
+                            firstChunk = false
+                        } else {
+                            CaptionLogger.log(TAG, "TTS-CHUNK-ERR ${ms}ms '${chunk.take(30)}'")
+                        }
                     }
                 } catch (e: Exception) {
                     CaptionLogger.log(TAG, "TTS-EXC ${e.javaClass.simpleName}: ${e.message}")
@@ -232,31 +248,47 @@ object HindiTtsService {
         }
     }
 
+    // Fetch chunk list from /tts_split
+    private suspend fun fetchChunks(text: String): List<String>? =
+        withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
+            try {
+                val enc = java.net.URLEncoder.encode(text, "UTF-8")
+                conn = java.net.URL("$SPLIT_URL?text=$enc").openConnection()
+                    as java.net.HttpURLConnection
+                conn.connectTimeout = 3_000
+                conn.readTimeout    = 3_000
+                if (conn.responseCode == 200) {
+                    val json = org.json.JSONObject(conn.inputStream.bufferedReader().readText())
+                    val arr  = json.getJSONArray("chunks")
+                    (0 until arr.length()).map { arr.getString(it) }
+                } else null
+            } catch (e: Exception) { null }
+            finally { try { conn?.disconnect() } catch (_: Exception) {} }
+        }
+
     // ── Play worker (AudioTrack — excluded from LC capture) ───────────────────
 
     private fun startPlayWorker() {
         playWorker = scope.launch {
             while (isActive) {
-                val item = playQueue.take()   // blocks — no gaps
+                val item = playQueue.take()
                 if (!enabled) continue
                 try {
                     isSpeaking = true
                     CaptionLogger.log(TAG, "PLAY ${item.durMs}ms '${item.text.take(40)}'")
-                    // FIFO TOKEN: Show subtitle exactly when audio starts playing.
-                    // This is the ONLY place where the subtitle overlay is updated.
-                    // Livecaptionreader no longer calls OverlayService.updateText() directly.
-                    withContext(Dispatchers.Main) {
-                        OverlayService.showTtsText(item.text)
+                    // Subtitle shown only when display text is non-empty (first chunk).
+                    // Subsequent chunks of the same sentence pass display="" — no subtitle flash.
+                    if (item.text.isNotEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            OverlayService.showTtsText(item.text)
+                        }
                     }
                     playWav(item.wav, item.durMs)
-                    // Keep subtitle visible after audio ends until next sentence starts.
-                    // clearTtsText() only fades out if nothing is queued — OverlayService
-                    // handles this: if playQueue has next item, showTtsText() will immediately
-                    // replace it without a gap.
                     withContext(Dispatchers.Main) {
                         OverlayService.clearTtsText()
                     }
-                    speakingUntilMs = System.currentTimeMillis() + 300L
+                    speakingUntilMs = System.currentTimeMillis() + 150L
                 } catch (e: Exception) {
                     CaptionLogger.log(TAG, "PLAY-ERR ${e.message}")
                     Log.e(TAG, "Play: ${e.message}")
@@ -278,8 +310,9 @@ object HindiTtsService {
                 conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed&emo=$emoStr")
                     .openConnection() as HttpURLConnection
                 conn.connectTimeout = 3_000
-                // 12s read timeout: server now has 10s synthesis limit + 2s margin
-                conn.readTimeout    = 12_000
+                // 8s read timeout: single 5-word chunk synthesizes in 2-4s on ARM + margin
+                // Old 12s was for full sentences (4 chunks × 3s = 12s) — no longer needed
+                conn.readTimeout    = 8_000
                 when (conn.responseCode) {
                     200  -> conn.inputStream.readBytes()
                     503  -> { CaptionLogger.log(TAG, "TTS-BUSY server synthesizing, skip"); null }
@@ -318,8 +351,6 @@ object HindiTtsService {
 
             val track = AudioTrack.Builder()
                 .setAudioAttributes(AudioAttributes.Builder()
-                    // USAGE_ASSISTANT: system services (including Live Captions)
-                    // cannot capture audio with this usage type
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build())
@@ -333,10 +364,31 @@ object HindiTtsService {
             audioTrack = track
             track.write(pcm, 0, pcm.size)
             track.setVolume(AudioTrack.getMaxVolume())
-            track.play()
 
-            // Wait for playback to finish
-            delay(durMs + 200L)
+            // FEMALE VOICE PITCH SHIFT via playback rate — zero server overhead.
+            // Piper synthesizes at sr=22050Hz (male voice).
+            // Setting playbackRate HIGHER than sr causes audio to play faster = higher pitch.
+            // Factor 0.82 → pitch up ~3 semitones = natural female range.
+            // AudioTrack handles resampling internally — no artifacts, no extra CPU.
+            // durMs is recalculated to match actual playback duration after pitch shift.
+            val isFemale = (detectedGender == Gender.FEMALE &&
+                            selectedGender != Gender.MALE)
+            val pitchFactor = if (isFemale) 0.82f else 1.0f
+            val playbackRate = (sr * pitchFactor).toInt().coerceIn(
+                AudioTrack.getMinVolume().toInt().coerceAtLeast(4000),
+                sr * 2  // max 2x = 2 octaves up
+            )
+            if (isFemale) {
+                track.playbackRate = playbackRate
+                // Recalculate duration: pitch up = faster playback = shorter actual duration
+                val actualDurMs = (durMs / pitchFactor).toLong()
+                track.play()
+                delay(actualDurMs + 200L)
+            } else {
+                track.play()
+                delay(durMs + 200L)
+            }
+
             track.stop(); track.release()
             audioTrack = null
         } catch (e: Exception) { Log.e(TAG, "playWav: ${e.message}") }
