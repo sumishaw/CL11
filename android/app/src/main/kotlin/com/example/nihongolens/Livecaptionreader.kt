@@ -367,13 +367,18 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Scheduling ────────────────────────────────────────────────────────────
 
     private fun norm(t: String) = t.trim().replace(Regex("\\s+"), " ")
+    private fun wc(t: String)   = t.trim().split(Regex("\\s+")).filter { it.isNotBlank() }.size
 
+    // State
     private var sentenceBuffer      = ""
     private var lastBufferEnqueued  = ""
     private var lastLCChangeMs      = 0L
     private var sentenceTimerJob: Job? = null
     private var lastEnqueuedWordCount = 0
     private var lastEnqueuedText      = ""
+    // Cooldown: track total LC word count and time at last submission
+    private var lastSubmitTotalWords  = 0
+    private var lastSubmitMs          = 0L
 
     private fun schedule(text: String) {
         // ── Language detection ────────────────────────────────────────────────
@@ -381,105 +386,138 @@ class LiveCaptionReader : AccessibilityService() {
         if (script != confirmedLang) {
             if (script == pendingLang) {
                 if (++pendingCount >= LANG_CONFIRM) {
-                    CaptionLogger.log(TAG, "LANG $confirmedLang→$script")
+                    CaptionLogger.log(TAG, "LANG $confirmedLang->$script")
                     confirmedLang = script; pendingLang = ""; pendingCount = 0
                     lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
                     sentenceBuffer = ""; lastBufferEnqueued = ""
                     lastEnqueuedWordCount = 0; lastEnqueuedText = ""
+                    lastSubmitTotalWords = 0; lastSubmitMs = 0L
                     queue.clear(); expectedSeq = seqCounter.get() + 1
                 }
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
 
-        // FULL-TEXT FIX: text is now the FULL LC window content.
-        // Extract only the untranslated TAIL — the part after lastEnqueuedText.
-        // This prevents re-translating sentences that have already been processed.
-        val untranslated = if (lastEnqueuedText.isNotEmpty() &&
-                               text.contains(lastEnqueuedText, ignoreCase = false)) {
-            val idx = text.indexOf(lastEnqueuedText) + lastEnqueuedText.length
-            text.substring(idx).trim()
-        } else {
-            text.trim()
+        val fullText   = text.trim()
+        val totalWords = wc(fullText)
+        lastLCChangeMs = System.currentTimeMillis()
+
+        // ── Extract UNTRANSLATED TAIL (word-count based, not indexOf) ─────────
+        // Use word-level matching — robust when LC reformats punctuation/capitalization
+        val untranslated: String = run {
+            if (lastEnqueuedText.isBlank()) return@run fullText
+            val lastWords = lastEnqueuedText.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            val fullWords = fullText.split(Regex("\\s+")).filter { it.isNotBlank() }
+            if (fullWords.size <= lastWords.size) return@run ""
+            // Match last 6 words of lastEnqueuedText against fullText
+            val matchLen = minOf(6, lastWords.size)
+            val suffix = lastWords.takeLast(matchLen).joinToString(" ").lowercase()
+            var found = -1
+            for (i in fullWords.indices) {
+                if (i + matchLen > fullWords.size) break
+                val candidate = fullWords.subList(i, i + matchLen).joinToString(" ").lowercase()
+                if (candidate == suffix) { found = i + matchLen; break }
+            }
+            if (found > 0 && found < fullWords.size)
+                fullWords.subList(found, fullWords.size).joinToString(" ")
+            else
+                fullText  // fallback: treat all as untranslated
         }
 
-        // If nothing new since last translation, just update the buffer and reset timer
-        if (untranslated.isBlank() || untranslated.length < 4) {
-            // Still update buffer so timer fires on silence with full text
-            sentenceBuffer = text
-            lastLCChangeMs = System.currentTimeMillis()
+        val newWords = wc(untranslated)
+
+        // ── COOLDOWN: Prevent re-submitting same text repeatedly ──────────────
+        // CT2 TIMEOUT cascade: without this, same sentence submitted 10x → 50s stuck
+        // Gate: only submit when 4+ NEW total words have arrived since last submission
+        // OR more than 3s has passed (allows retry after silence)
+        val wordsSinceSubmit = totalWords - lastSubmitTotalWords
+        val timeSinceSubmit  = System.currentTimeMillis() - lastSubmitMs
+        if (lastSubmitMs > 0L && wordsSinceSubmit < 4 && timeSinceSubmit < 3_000L) {
+            sentenceBuffer = untranslated
+            // Still run silence timer so we catch end-of-speech
+            sentenceTimerJob?.cancel()
+            if (newWords >= 5) {
+                sentenceTimerJob = scope.launch {
+                    delay(SENTENCE_SILENCE_MS_PRIMARY)
+                    val t = sentenceBuffer.trim()
+                    if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= 5) {
+                        CaptionLogger.log(TAG, "SILENCE-COOLDOWN wc=${wc(t)}")
+                        doSubmit(t, totalWords)
+                    }
+                }
+            }
             return
         }
 
-        sentenceBuffer = untranslated   // work on the untranslated portion
-        lastLCChangeMs = System.currentTimeMillis()
+        if (untranslated.isBlank() || newWords < 2) {
+            sentenceBuffer = untranslated; return
+        }
 
-        val trimmed   = untranslated
-        val wordCount = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-        val lastChar  = trimmed.lastOrNull() ?: return
+        sentenceBuffer = untranslated
+        val lastChar = untranslated.lastOrNull() ?: return
 
-        // ── RULE 1: HARD sentence-end punctuation ─────────────────────────────
-        if (lastChar in HARD_END_CHARS && wordCount >= MIN_WORDS_HARD) {
+        // ── RULE 1: HARD sentence-end ─────────────────────────────────────────
+        if (lastChar in HARD_END_CHARS && newWords >= MIN_WORDS_HARD) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(80)
                 val t = sentenceBuffer.trim()
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    CaptionLogger.log(TAG, "HARD-END '${lastChar}' wc=$wordCount")
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
-                    enqueue(t); sentenceBuffer = ""
+                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= MIN_WORDS_HARD) {
+                    CaptionLogger.log(TAG, "HARD-END '$lastChar' wc=${wc(t)}")
+                    doSubmit(t, totalWords)
                 }
             }
             return
         }
 
-        // ── RULE 2: SOFT clause-end punctuation ───────────────────────────────
-        // Raised MIN_WORDS_SOFT: was 6, now 8 — prevents translating ", wait about" (3 words)
-        if (lastChar in SOFT_END_CHARS && wordCount >= 8) {
+        // ── RULE 2: SOFT clause-end — wait for more ───────────────────────────
+        if (lastChar in SOFT_END_CHARS && newWords >= 8) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             sentenceTimerJob = scope.launch {
                 delay(SENTENCE_SILENCE_MS_SOFT)
                 val t = sentenceBuffer.trim()
-                val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-                if (t.isNotBlank() && t != lastEnqueuedText && wc >= 6) {
-                    CaptionLogger.log(TAG, "SOFT-END '${lastChar}' wc=$wc")
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wc
-                    enqueue(t); sentenceBuffer = ""
+                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= 6) {
+                    CaptionLogger.log(TAG, "SOFT-END '$lastChar' wc=${wc(t)}")
+                    doSubmit(t, totalWords)
                 }
             }
             return
         }
 
-        // ── RULE 3: SAFETY NET — very long (run-on, no punctuation) ──────────
-        if (wordCount >= MAX_WORDS_BEFORE_FORCE && wordCount > lastEnqueuedWordCount + 8) {
+        // ── RULE 3: FORCE — run-on with 6+ new words since last submit ────────
+        if (newWords >= MAX_WORDS_BEFORE_FORCE && wordsSinceSubmit >= 6) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(200)
+                delay(150)
                 val t = sentenceBuffer.trim()
-                val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-                if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SILENCE) {
-                    CaptionLogger.log(TAG, "FORCE wc=$wc (>$MAX_WORDS_BEFORE_FORCE)")
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wc
-                    enqueue(t); sentenceBuffer = ""
+                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= MIN_WORDS_SILENCE) {
+                    CaptionLogger.log(TAG, "FORCE wc=${wc(t)} new=$wordsSinceSubmit")
+                    doSubmit(t, totalWords)
                 }
             }
             return
         }
 
         // ── RULE 4: SILENCE GAP ───────────────────────────────────────────────
-        // Raised minimum word count: 5 (was 3) — avoids translating 3-word fragments
-        // "a big break" (3 words) should NOT fire. "She needed to take a break" (7 words) should.
-        sentenceTimerJob?.cancel()
-        pendingJob?.cancel()
-        sentenceTimerJob = scope.launch {
-            delay(SENTENCE_SILENCE_MS_PRIMARY)
-            val t = sentenceBuffer.trim()
-            val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-            if (t.isNotBlank() && t != lastEnqueuedText && wc >= 5) {
-                CaptionLogger.log(TAG, "SILENCE ${SENTENCE_SILENCE_MS_PRIMARY}ms wc=$wc")
-                lastEnqueuedText = t; lastEnqueuedWordCount = wc
-                enqueue(t); sentenceBuffer = ""
+        sentenceTimerJob?.cancel(); pendingJob?.cancel()
+        if (newWords >= 5) {
+            sentenceTimerJob = scope.launch {
+                delay(SENTENCE_SILENCE_MS_PRIMARY)
+                val t = sentenceBuffer.trim()
+                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= 5) {
+                    CaptionLogger.log(TAG, "SILENCE ${SENTENCE_SILENCE_MS_PRIMARY}ms wc=${wc(t)}")
+                    doSubmit(t, totalWords)
+                }
             }
         }
+    }
+
+    private fun doSubmit(text: String, currentTotalWords: Int) {
+        lastEnqueuedText      = text
+        lastEnqueuedWordCount = wc(text)
+        lastSubmitTotalWords  = currentTotalWords
+        lastSubmitMs          = System.currentTimeMillis()
+        sentenceBuffer        = ""
+        enqueue(text)
     }
 
     private fun enqueue(text: String) {
