@@ -270,7 +270,22 @@ object HindiTtsService {
                 }
 
                 val t0 = System.currentTimeMillis()
-                val wavFile = synthesizeToFile(item) ?: continue
+
+                // FIX BUG 2: Apply feminine Hindi verb/adjective/adverb conversion
+                // ALWAYS for female voice — not just when English pronouns found.
+                // The original speaker is detected as female by GenderAnalyzer (F0 pitch).
+                // So ALL her speech should use feminine Hindi grammar forms.
+                // toFeminineHindi() replaces था→थी, ता है→ती है, गया→गई, etc.
+                val textToSpeak = if (item.gender == "female")
+                    toFeminineHindi(item.text)
+                else
+                    item.text
+
+                if (textToSpeak != item.text)
+                    CaptionLogger.log(TAG, "FEM-CONV '${item.text.take(30)}' → '${textToSpeak.take(30)}'")
+
+                val spokenItem = item.copy(text = textToSpeak)
+                val wavFile = synthesizeToFile(spokenItem) ?: continue
                 val ms = System.currentTimeMillis() - t0
 
                 // Estimate duration from WAV file size
@@ -284,8 +299,8 @@ object HindiTtsService {
                 // This is done here (not server) because Android TTS bypasses /tts endpoint.
                 val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
 
-                CaptionLogger.log(TAG, "TTS-WAV ${ms}ms ${durMs}ms bg=${item.bgSeq} '${item.text.take(40)}'")
-                playQueue.offer(PlayItem(item.text, mixedFile, durMs))
+                CaptionLogger.log(TAG, "TTS-WAV ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
+                playQueue.offer(PlayItem(textToSpeak, mixedFile, durMs))
             }
         }
     }
