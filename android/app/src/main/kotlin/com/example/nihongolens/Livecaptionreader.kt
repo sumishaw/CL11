@@ -314,20 +314,27 @@ class LiveCaptionReader : AccessibilityService() {
             CaptionLogger.log(TAG, "LC appeared '${full.take(60)}'")
         }
 
+        // No change — nothing to process
         if (full == lastRawFull) return null
 
         val prev    = lastRawFull
         lastRawFull = full
 
-        val newText = if (prev.isNotEmpty() && full.startsWith(prev))
-            full.substring(prev.length).trim()
-        else {
-            val sentences = full.split(Regex("""(?<=[.!?。！？])\s+"""))
-            sentences.lastOrNull { it.trim().length >= 4 }?.trim() ?: return null
-        }
-
-        if (newText.length >= 4) return newText
-        return null
+        // KEY FIX: Return the FULL window text to schedule(), not just the delta.
+        //
+        // PREVIOUS (broken): returned only newText = full.substring(prev.length)
+        // This caused schedule() to see tiny fragments: "a big break", ", wait about"
+        // Each fragment triggered a 900ms silence timer → 5+ separate translations
+        // for what should have been ONE complete sentence.
+        //
+        // NOW: return the FULL current LC text. schedule() accumulates it in
+        // sentenceBuffer and the sentence-completion detector (punctuation/silence)
+        // decides when to translate. The FULL text means the translation gets the
+        // complete grammatical sentence — accurate Hindi output.
+        //
+        // LC text that doesn't start where we left off = new sentence block started
+        // (LC scrolled, new speaker, etc.) — in that case still return the full new text.
+        return if (full.length >= 4) full else null
     }
 
     private fun splitSentences(text: String): List<String> {
@@ -384,20 +391,37 @@ class LiveCaptionReader : AccessibilityService() {
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
 
-        sentenceBuffer = text
+        // FULL-TEXT FIX: text is now the FULL LC window content.
+        // Extract only the untranslated TAIL — the part after lastEnqueuedText.
+        // This prevents re-translating sentences that have already been processed.
+        val untranslated = if (lastEnqueuedText.isNotEmpty() &&
+                               text.contains(lastEnqueuedText, ignoreCase = false)) {
+            val idx = text.indexOf(lastEnqueuedText) + lastEnqueuedText.length
+            text.substring(idx).trim()
+        } else {
+            text.trim()
+        }
+
+        // If nothing new since last translation, just update the buffer and reset timer
+        if (untranslated.isBlank() || untranslated.length < 4) {
+            // Still update buffer so timer fires on silence with full text
+            sentenceBuffer = text
+            lastLCChangeMs = System.currentTimeMillis()
+            return
+        }
+
+        sentenceBuffer = untranslated   // work on the untranslated portion
         lastLCChangeMs = System.currentTimeMillis()
 
-        val trimmed   = text.trim()
+        val trimmed   = untranslated
         val wordCount = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }.size
         val lastChar  = trimmed.lastOrNull() ?: return
 
         // ── RULE 1: HARD sentence-end punctuation ─────────────────────────────
-        // Covers: . ! ? 。！？ । ॥ ؟ ۔ … and all other definitive sentence-end chars
-        // These mean the sentence is DEFINITELY complete — translate immediately.
         if (lastChar in HARD_END_CHARS && wordCount >= MIN_WORDS_HARD) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(80)  // 80ms debounce — wait for LC to finalize this text
+                delay(80)
                 val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     CaptionLogger.log(TAG, "HARD-END '${lastChar}' wc=$wordCount")
@@ -409,16 +433,15 @@ class LiveCaptionReader : AccessibilityService() {
         }
 
         // ── RULE 2: SOFT clause-end punctuation ───────────────────────────────
-        // , ; : — etc. May or may not end the sentence.
-        // Wait 1.4s silence. If LC adds more words → accumulate. If silent → translate.
-        if (lastChar in SOFT_END_CHARS && wordCount >= MIN_WORDS_SOFT) {
+        // Raised MIN_WORDS_SOFT: was 6, now 8 — prevents translating ", wait about" (3 words)
+        if (lastChar in SOFT_END_CHARS && wordCount >= 8) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             sentenceTimerJob = scope.launch {
                 delay(SENTENCE_SILENCE_MS_SOFT)
                 val t = sentenceBuffer.trim()
                 val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-                if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SOFT) {
-                    CaptionLogger.log(TAG, "SOFT-END '${lastChar}' wc=$wc after ${SENTENCE_SILENCE_MS_SOFT}ms")
+                if (t.isNotBlank() && t != lastEnqueuedText && wc >= 6) {
+                    CaptionLogger.log(TAG, "SOFT-END '${lastChar}' wc=$wc")
                     lastEnqueuedText = t; lastEnqueuedWordCount = wc
                     enqueue(t); sentenceBuffer = ""
                 }
@@ -426,17 +449,15 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // ── RULE 3: SAFETY NET — very long sentence (run-on, no punctuation) ──
-        // Some LC captions never add punctuation (filler speech, lists, etc.)
-        // After 15 words, translate what we have to avoid indefinite accumulation.
+        // ── RULE 3: SAFETY NET — very long (run-on, no punctuation) ──────────
         if (wordCount >= MAX_WORDS_BEFORE_FORCE && wordCount > lastEnqueuedWordCount + 8) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(200)  // brief debounce
+                delay(200)
                 val t = sentenceBuffer.trim()
                 val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
                 if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SILENCE) {
-                    CaptionLogger.log(TAG, "FORCE wc=$wc (>$MAX_WORDS_BEFORE_FORCE, no punct)")
+                    CaptionLogger.log(TAG, "FORCE wc=$wc (>$MAX_WORDS_BEFORE_FORCE)")
                     lastEnqueuedText = t; lastEnqueuedWordCount = wc
                     enqueue(t); sentenceBuffer = ""
                 }
@@ -445,16 +466,15 @@ class LiveCaptionReader : AccessibilityService() {
         }
 
         // ── RULE 4: SILENCE GAP ───────────────────────────────────────────────
-        // No punctuation, sentence not too long yet.
-        // Start a timer: if LC goes silent for 900ms, treat current buffer as complete.
-        // If LC adds more text before timer fires → cancel timer (sentence still growing).
+        // Raised minimum word count: 5 (was 3) — avoids translating 3-word fragments
+        // "a big break" (3 words) should NOT fire. "She needed to take a break" (7 words) should.
         sentenceTimerJob?.cancel()
         pendingJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS_PRIMARY)
             val t = sentenceBuffer.trim()
             val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-            if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SILENCE) {
+            if (t.isNotBlank() && t != lastEnqueuedText && wc >= 5) {
                 CaptionLogger.log(TAG, "SILENCE ${SENTENCE_SILENCE_MS_PRIMARY}ms wc=$wc")
                 lastEnqueuedText = t; lastEnqueuedWordCount = wc
                 enqueue(t); sentenceBuffer = ""
