@@ -113,9 +113,9 @@ class LiveCaptionReader : AccessibilityService() {
         )
 
         // ── MINIMUM WORDS FOR TRANSLATION ────────────────────────────────────
-        private const val MIN_WORDS_HARD    = 3   // after hard punctuation
+        private const val MIN_WORDS_HARD    = 2   // after hard punctuation (lowered: "Do you?" = 2 words, must translate)
         private const val MIN_WORDS_SOFT    = 6   // after soft punctuation
-        private const val MIN_WORDS_SILENCE = 5   // after silence gap (raised from 3 → stops 3-word fragments)
+        private const val MIN_WORDS_SILENCE = 5   // after silence gap
 
         // ── FORCE / COOLDOWN THRESHOLDS ───────────────────────────────────────
         // MAX_WORDS_BEFORE_FORCE: raised 15→20. At 15, a 60-word paragraph triggered
@@ -405,26 +405,21 @@ class LiveCaptionReader : AccessibilityService() {
         val totalWords = wc(fullText)
         lastLCChangeMs = System.currentTimeMillis()
 
-        // ── Extract UNTRANSLATED TAIL (word-count based, not indexOf) ─────────
-        // Use word-level matching — robust when LC reformats punctuation/capitalization
+        // ── Extract UNTRANSLATED TAIL (cumulative word-count tracking) ────────
+        // PREVIOUS APPROACH (broken): match last 6 words of lastEnqueuedText in fullText.
+        // Problem: 'is go' appears in multiple places in a 100-word paragraph → wrong match
+        // → same sentence re-submitted 3 times as seq=33, 34, 36.
+        //
+        // NEW APPROACH: track how many total LC words existed when we last submitted.
+        // untranslatedStart = lastSubmitTotalWords (total words at last submit time)
+        // untranslated      = words from position lastSubmitTotalWords onward
+        // This is O(1) and immune to word-content collisions.
         val untranslated: String = run {
-            if (lastEnqueuedText.isBlank()) return@run fullText
-            val lastWords = lastEnqueuedText.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            if (lastSubmitTotalWords <= 0) return@run fullText
             val fullWords = fullText.split(Regex("\\s+")).filter { it.isNotBlank() }
-            if (fullWords.size <= lastWords.size) return@run ""
-            // Match last 6 words of lastEnqueuedText against fullText
-            val matchLen = minOf(6, lastWords.size)
-            val suffix = lastWords.takeLast(matchLen).joinToString(" ").lowercase()
-            var found = -1
-            for (i in fullWords.indices) {
-                if (i + matchLen > fullWords.size) break
-                val candidate = fullWords.subList(i, i + matchLen).joinToString(" ").lowercase()
-                if (candidate == suffix) { found = i + matchLen; break }
-            }
-            if (found > 0 && found < fullWords.size)
-                fullWords.subList(found, fullWords.size).joinToString(" ")
-            else
-                fullText  // fallback: treat all as untranslated
+            val startIdx  = lastSubmitTotalWords.coerceAtMost(fullWords.size)
+            if (startIdx >= fullWords.size) return@run ""
+            fullWords.subList(startIdx, fullWords.size).joinToString(" ")
         }
 
         val newWords = wc(untranslated)
