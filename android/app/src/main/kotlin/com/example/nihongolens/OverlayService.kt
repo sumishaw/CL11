@@ -244,9 +244,8 @@ class OverlayService : Service() {
         // if alpha got stuck at exactly 0.5 or if the first animation didn't complete.
         // New code: if fading out or invisible, immediately show; otherwise leave as-is.
         tv.animate().cancel()
-        if (tv.alpha < 0.9f) {
-            tv.alpha = 1f   // snap to visible immediately — no 120ms delay on first show
-        }
+        tv.alpha = 1f   // ALWAYS snap to visible — covers post-music resume
+        tv.visibility = android.view.View.VISIBLE
     }
 
     private fun fadeOut() {
@@ -264,7 +263,7 @@ class OverlayService : Service() {
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
         silenceRunnable = Runnable { if (backlog.isEmpty() && !active) fadeOut() }
-        handler.postDelayed(silenceRunnable!!, 12_000)
+        handler.postDelayed(silenceRunnable!!, 60_000)  // 60s: music can be long
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
