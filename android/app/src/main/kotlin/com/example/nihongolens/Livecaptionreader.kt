@@ -42,7 +42,7 @@ class LiveCaptionReader : AccessibilityService() {
         // 900ms: catches natural speaker pauses between sentences without cutting mid-sentence.
         // Previously 600ms was too short — partial clauses got translated mid-thought.
         private const val SENTENCE_SILENCE_MS_PRIMARY = 900L   // after hard punctuation or long sentence
-        private const val SENTENCE_SILENCE_MS_SOFT    = 1_400L // after soft comma/clause — wait for more
+        private const val SENTENCE_SILENCE_MS_SOFT    = 1_000L // reduced for continuous dialogue flow
 
         // ── MULTILINGUAL HARD SENTENCE-END MARKERS ───────────────────────────
         // These characters definitively end a sentence in their respective languages.
@@ -300,7 +300,7 @@ class LiveCaptionReader : AccessibilityService() {
                 lastEnqueuedSents.clear()
                 val dropped = queue.size
                 queue.clear()
-                expectedSeq = seqCounter.get() + 1
+                // FIFO: no expectedSeq reset — sentences queue in order
                 pendingJob?.cancel(); pendingJob = null
                 if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped")
                 else              CaptionLogger.log(TAG, "LC gone")
@@ -409,7 +409,7 @@ class LiveCaptionReader : AccessibilityService() {
                     sentenceBuffer = ""; lastBufferEnqueued = ""
                     lastEnqueuedWordCount = 0; lastEnqueuedText = ""
                     lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
-                    queue.clear(); expectedSeq = seqCounter.get() + 1
+                    queue.clear()  // FIFO: expectedSeq NOT reset — old sentences still valid
                 }
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
@@ -538,10 +538,10 @@ class LiveCaptionReader : AccessibilityService() {
                         500L   // complete sentence: translate quickly
                     } else {
                         CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — slow silence 1400ms")
-                        1_400L // fragment: wait longer for more text
+                        900L   // reduced from 1400ms for continuous dialogue flow
                     }
                 } else {
-                    1_400L // too short: always wait for more
+                    900L  // short text: 900ms (was 1400ms — too slow for dialogue)
                 }
                 delay(silenceMs)
                 val t2 = sentenceBuffer.trim()
@@ -670,7 +670,7 @@ class LiveCaptionReader : AccessibilityService() {
             val text  = item.text
             val ageMs = System.currentTimeMillis() - item.enqMs
 
-            if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
+            // FIFO: removed seq < expectedSeq check — all queued sentences translate in order
             // CRITICAL FIX: Drop sentences >5s old (was 15s)
             // FIFO: no expiry — every sentence translates, even if delayed
             // Backlog only clears when Caption Lens is explicitly stopped
@@ -722,13 +722,9 @@ class LiveCaptionReader : AccessibilityService() {
             activeTranslations.remove(nText)
             val ms     = System.currentTimeMillis() - t0
 
-            // CRITICAL FIX: With 6s timeout, if it still takes >4s the sentence is too old
-            if (ms > 4_000L && seq < expectedSeq) {
-                CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
-                continue
-            }
-
-            if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
+            // FIFO: never discard translated sentences — play in order regardless of seq
+            // Previously: seq < expectedSeq caused mass discards when LC gone/appeared
+            // Now: every successfully translated sentence reaches TTS
 
             if (result == null) {
                 errCount.incrementAndGet()
