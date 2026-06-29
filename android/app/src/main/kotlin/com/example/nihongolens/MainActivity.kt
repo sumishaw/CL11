@@ -188,6 +188,9 @@ class MainActivity : FlutterActivity() {
                     val n = (call.arguments as? Int) ?: 300
                     result.success(CaptionLogger.getRecentLines(n))
                 }
+                "getLogStats"  -> result.success(CaptionLogger.getStats())
+                "downloadLogs" -> result.success(CaptionLogger.downloadLogs(this))
+                "clearLogs"    -> { CaptionLogger.clearLines(); result.success(null) }
 
                 "clearLogs" -> {
                     CaptionLogger.clearLines()
