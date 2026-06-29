@@ -222,21 +222,17 @@ class OverlayService : Service() {
         if (backlog.isNotEmpty()) {
             active = false
             advance()
-        } else {
-            // Nothing queued — keep showing current subtitle briefly then fade
-            holdRunnable = Runnable {
-                holdRunnable = null
-                if (backlog.isEmpty()) fadeOut()
-                else { active = false; advance() }
-            }
-            handler.postDelayed(holdRunnable!!, 1_500L)
         }
+        // Nothing queued: KEEP current subtitle visible — no blank flash.
+        // Next sentence will replace it when it arrives (~0.8s CT2 gap).
+        // Silence timer (60s) handles true end-of-content fade.
     }
 
     // ── View helpers ──────────────────────────────────────────────────────────
 
     private fun setTextDirect(text: String) {
         val tv = textView ?: return
+        if (text.isBlank()) return  // never blank the overlay from subtitle updates
         tv.maxLines = 10   // never truncate — show complete sentence
         tv.text = text
         // FIX: Always ensure visible — don't gate on alpha check.
