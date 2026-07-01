@@ -729,8 +729,20 @@ object HindiTtsService {
 
 
 
-    private suspend fun synthesizeToFile(item: FetchItem): File? =
-        synthesizeMutex.withLock {
+    private suspend fun synthesizeToFile(item: FetchItem): File? {
+        // Timeout on mutex acquire — if previous synthesis hung, don't wait forever
+        val acquired = try {
+            withTimeoutOrNull(8_000L) { synthesizeMutex.lock(); true } ?: false
+        } catch (_: Exception) { false }
+        if (!acquired) {
+            CaptionLogger.log(TAG, "SYNTH-MUTEX-TIMEOUT: previous synthesis hung, skipping", CaptionLogger.LEVEL_ERROR)
+            return null
+        }
+        return try { synthesizeToFileInner(item) } finally { synthesizeMutex.unlock() }
+    }
+
+    private suspend fun synthesizeToFileInner(item: FetchItem): File? =
+        withContext(Dispatchers.IO) {
             withContext(Dispatchers.IO) {
             val localTts = tts ?: return@withContext null
             val outFile = File(cacheDir, "tts_${UUID.randomUUID()}.wav")
@@ -761,8 +773,17 @@ object HindiTtsService {
             val inputText: String
             val inputBundle: android.os.Bundle?
 
+            // SSML safety: validate that text is safe for SSML before building
+            // Malformed SSML (bad chars, empty tags) causes TTS to hang/produce empty WAV
+            val safeText = item.text
+                .replace("&", "and")   // & breaks SSML XML parsing
+                .replace("<", "")      // stray < breaks SSML
+                .replace(">", "")      // stray > breaks SSML
+                .trim()
+            if (safeText.isBlank()) return@withContext null
+
             // Expressive emotions get special SSML texture (breaks, emphasis, contours)
-            val expressiveSsml = emotionSsml(item.text, item.emotion,
+            val expressiveSsml = emotionSsml(safeText, item.emotion,
                 run { val pct = ((item.pitch - 1f) * 100f).toInt()
                       if (pct >= 0) "+${pct}%" else "${pct}%" })
 
@@ -814,8 +835,26 @@ object HindiTtsService {
                     }
 
                 if (!outFile.exists() || outFile.length() < 100) {
-                    CaptionLogger.log(TAG, "TTS output file empty")
-                    return@withContext null
+                    CaptionLogger.log(TAG, "TTS output file empty — retrying with plain text", CaptionLogger.LEVEL_WARN)
+                    // SSML may have caused empty output — retry with plain text
+                    if (inputText.startsWith("<speak>")) {
+                        val plainId = UUID.randomUUID().toString()
+                        val plainDeferred = CompletableDeferred<Unit>()
+                        pendingUtterances[plainId] = { plainDeferred.complete(Unit) }
+                        val plainResult = localTts.synthesizeToFile(safeText, null, outFile, plainId)
+                        if (plainResult == TextToSpeech.SUCCESS) {
+                            withTimeoutOrNull(8_000L) { plainDeferred.await() }
+                        } else {
+                            pendingUtterances.remove(plainId)
+                        }
+                        if (!outFile.exists() || outFile.length() < 100) {
+                            CaptionLogger.log(TAG, "TTS plain text also empty — skip")
+                            return@withContext null
+                        }
+                        CaptionLogger.log(TAG, "TTS plain text fallback succeeded")
+                    } else {
+                        return@withContext null
+                    }
                 }
 
                 outFile
@@ -824,7 +863,7 @@ object HindiTtsService {
                 CaptionLogger.log(TAG, "TTS-EXC ${e.message}")
                 null
             }
-        } } // end withContext + synthesizeMutex.withLock
+        } // end withContext
 
     // ── Play worker: WAV → AudioTrack ─────────────────────────────────────────
 
@@ -1136,4 +1175,5 @@ object HindiTtsService {
 
         return t
     }
+}
 }
