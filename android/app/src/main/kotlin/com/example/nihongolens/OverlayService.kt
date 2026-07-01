@@ -11,28 +11,20 @@ import android.util.TypedValue
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.atomic.AtomicLong
 
 /**
- * OverlayService — Hindi subtitle overlay with dedicated FIFO backlog
+ * OverlayService v3 — Radical simplification
  *
- * FIFO backlog (unbounded LinkedBlockingQueue):
- *   - Every translation is enqueued — nothing is ever dropped
- *   - Items displayed in order at holdMs pace
- *   - Token system: LC going away (onClear) advances expectedToken,
- *     draining stale items silently
+ * DESIGN PRINCIPLE: The overlay is a dumb display surface.
+ * It shows whatever text it's given. It never decides to hide text.
+ * It only fades after 5 minutes of absolute silence.
  *
- * Speed modes (holdMs set via setHoldMs):
- *   0     = Live   — show instantly, no hold, no word-by-word
- *   2000  = Fastest
- *   4000  = Fast
- *   6000  = Average (default)
- *   8000  = Slow
- *   10000 = Slowest
+ * NO tokens, NO backlog, NO advance(), NO active flag, NO holdRunnable.
+ * Every subtitle update calls setTextDirect() and that's it.
  *
- * Word-by-word: words appear at msPerWord = holdMs*0.5/totalWords
- * so sentence fills in first half of hold period, second half is reading time.
+ * The old complexity (tokens, expectedToken, advance, active, holdRunnable)
+ * created race conditions where multiple timers competed and left the
+ * overlay stuck with no error. Removed entirely.
  */
 class OverlayService : Service() {
 
@@ -40,73 +32,40 @@ class OverlayService : Service() {
         const val CHANNEL_ID = "nihongo_overlay"
         const val NOTIF_ID   = 1
 
-        // FIX: Default to Live mode (holdMs=0) — shows each subtitle immediately,
-        // replaced by the next one as it arrives. This matches real-time subtitle behavior.
-        // Old default was 6000ms — subtitles held 6s each, causing a backlog and
-        // appearing "stuck" while translations kept arriving faster than display advanced.
-        // User can change speed from Flutter UI settings if they prefer slower pacing.
-        @Volatile @JvmField var holdMs: Long = 0L
-
+        @Volatile @JvmField var holdMs: Long = 0L  // kept for API compat, unused in v3
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
-
         @Volatile var instance: OverlayService? = null
 
+        // ── Public API ────────────────────────────────────────────────────────
+
         fun updateText(original: String, hindi: String) {
-            latestOriginal = original; latestHindi = hindi
-            // DECOUPLED MODE: Show subtitle immediately when translation arrives.
-            // No longer waiting for TTS audio — subtitle speed = CT2 speed (~0.8s).
-            // Audio plays 0.2s later (TTS synthesis) — natural read-then-hear experience.
+            latestOriginal = original
+            latestHindi    = hindi
             if (hindi.isNotBlank()) {
-                instance?.handler?.post { instance?.onNewHindi(hindi) }
+                instance?.showText(hindi)
             }
         }
 
-        // Called by TTS play worker when it STARTS speaking a sentence.
-        // Shows the Hindi subtitle in sync with the audio — this is the FIFO refresh.
-        // The subtitle that appears is exactly what is being spoken right now.
         fun showTtsText(hindi: String) {
-            instance?.handler?.post {
-                instance?.setTextDirect(hindi)
+            if (hindi.isNotBlank()) {
+                instance?.showText(hindi)
             }
         }
 
-        // Called by TTS play worker when speech ends.
-        // Advances the subtitle display to the next queued item (FIFO refresh).
-        // If nothing queued, starts fade-out timer.
-        fun clearTtsText() {
-            instance?.handler?.post {
-                instance?.onTtsComplete()
-            }
-        }
+        // Called when TTS finishes — no-op in v3 (overlay keeps showing)
+        fun clearTtsText() { /* intentionally empty — overlay never clears on TTS end */ }
+
+        // Called on explicit stop
         fun clearQueue() {
-            CaptionLogger.log("Overlay", "clearQueue() called", CaptionLogger.LEVEL_WARN)
-            instance?.handler?.post { instance?.onClear() }
+            instance?.handler?.post { instance?.fadeOut() }
         }
-        fun setHoldMs(ms: Long) {
-            val v = ms.coerceIn(0, 15_000)
-            holdMs = v
-            if (v == 0L) instance?.handler?.post { instance?.switchToLive() }
-        }
+
+        fun setHoldMs(ms: Long) { holdMs = ms.coerceIn(0, 15_000) }
     }
-
-    // ── FIFO backlog — unbounded, never drops sentences ───────────────────────
-    private val tokenCounter  = AtomicLong(0)
-    @Volatile private var expectedToken = 0L
-
-    data class Item(val token: Long, val text: String)
-    private val backlog = LinkedBlockingQueue<Item>()  // FIFO, unbounded
-
-    // Display state (main thread only)
-    private var active       = false
-    private var wordRunnable: Runnable? = null
-    private var holdRunnable: Runnable? = null
-    private var silenceRunnable: Runnable? = null
-    private var lastTextShownMs: Long = 0L  // timestamp of last subtitle shown
 
     val handler = Handler(Looper.getMainLooper())
 
-    // Views
     private var windowManager: WindowManager?              = null
     var textView:      TextView?                   = null
     private var overlayView:   View?                       = null
@@ -114,6 +73,10 @@ class OverlayService : Service() {
 
     @Volatile private var alive     = true
     @Volatile private var viewAdded = false
+
+    // Silence timer — the ONLY timer in v3
+    private var silenceToken = 0  // increment to invalidate old timer
+    private val SILENCE_MS   = 300_000L  // 5 minutes
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
@@ -138,7 +101,6 @@ class OverlayService : Service() {
     override fun onDestroy() {
         alive = false; instance = null
         handler.removeCallbacksAndMessages(null)
-        backlog.clear()
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
@@ -146,192 +108,78 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── New translation ───────────────────────────────────────────────────────
+    // ── Core display — the ONLY path ─────────────────────────────────────────
 
-    private fun onNewHindi(hindi: String) {
-        if (hindi.isBlank()) return
-        val token = tokenCounter.incrementAndGet()
-
-        if (holdMs == 0L) {
-            // Live mode: show immediately, replace whatever is showing
-            cancelAllTimers()  // cancel ALL including stale silenceRunnable
-            active = false
-            backlog.clear()
-            backlog.offer(Item(token, hindi.trim()))
-            advance()
-        } else {
-            // Timed mode: queue and advance when ready
-            backlog.offer(Item(token, hindi.trim()))
-            if (!active) advance()
-        }
-        reschedSilence()
+    // Called from any thread — posts to main thread
+    fun showText(text: String) {
+        if (text.isBlank()) return
+        handler.post { setTextDirect(text) }
     }
 
-    private fun onClear() {
-        expectedToken = tokenCounter.get() + 1
-        backlog.clear()
-        cancelTimers()
-        active = false
-        fadeOut()
-    }
-
-    private fun switchToLive() {
-        cancelTimers(); active = false; backlog.clear()
-    }
-
-    // ── Display loop ──────────────────────────────────────────────────────────
-    // Shows FULL sentence immediately. Holds until next sentence or holdMs expires.
-
-    private fun advance() {
-        cancelAllTimers()  // cancel ALL timers including stale silenceRunnable
-
-        // Drain stale tokens
-        while (true) {
-            val head = backlog.peek() ?: break
-            if (head.token >= expectedToken) break
-            backlog.poll()
-        }
-
-        val item = backlog.poll() ?: run {
-            active = false
-            CaptionLogger.log("Overlay", "advance: backlog empty — subtitle stays visible", CaptionLogger.LEVEL_DEBUG)
-            return
-        }
-        if (item.token < expectedToken) { advance(); return }
-
-        active = true
-
-        // Show FULL sentence immediately
-        setTextDirect(item.text)
-
-        // In Live mode: hold 10s max (will be replaced by next translation before that)
-        // In timed mode: hold for holdMs then advance
-        val hold = if (holdMs == 0L) 300_000L else holdMs  // 5min: covers long silent scenes
-
-        holdRunnable = Runnable {
-            holdRunnable = null
-            if (!alive) return@Runnable
-            // FIX: Never fade when backlog empty — keep last subtitle visible
-            // until silence timer (60s) or next translation replaces it.
-            // Old: fadeOut() here caused overlay to disappear mid-conversation.
-            if (backlog.isNotEmpty()) {
-                active = false; advance()
-            } else {
-                // Nothing queued yet — stay visible, next sentence will replace
-                active = false
-                CaptionLogger.log("Overlay", "hold-expire: staying visible, no next sentence yet")
-            }
-        }
-        handler.postDelayed(holdRunnable!!, hold)
-    }
-
-    // Called when TTS finishes speaking one sentence.
-    // Advances display to next queued subtitle (FIFO), or fades out if empty.
-    private fun onTtsComplete() {
-        cancelAllTimers()  // cancel ALL including any stale silenceRunnable
-        if (backlog.isNotEmpty()) {
-            active = false
-            advance()  // advance() will reschedSilence via setTextDirect
-        } else {
-            reschedSilence()  // nothing queued — just keep timer alive
-        }
-    }
-
-    // ── View helpers ──────────────────────────────────────────────────────────
-
+    // Must run on main thread
     private fun setTextDirect(text: String) {
+        if (!alive) return
         val tv = textView ?: return
-        if (text.isBlank()) return  // never blank the overlay from subtitle updates
-        tv.maxLines = 10   // never truncate — show complete sentence
+        if (text.isBlank()) return
+
+        // Show text immediately, always
         tv.text = text
-        // FIX: Always ensure visible — don't gate on alpha check.
-        // Old code: if (tv.alpha < 0.5f) animate. This caused subtitles to never appear
-        // if alpha got stuck at exactly 0.5 or if the first animation didn't complete.
-        // New code: if fading out or invisible, immediately show; otherwise leave as-is.
         tv.animate().cancel()
-        tv.alpha = 1f   // ALWAYS snap to visible — covers post-music resume
-        tv.visibility = android.view.View.VISIBLE
-        lastTextShownMs = System.currentTimeMillis()
+        tv.alpha = 1f
+        tv.visibility = View.VISIBLE
+
         CaptionLogger.onOverlayTextSet(text, 1f, true)
-        reschedSilence()  // reset 300s timer every time subtitle shown
+
+        // Reset 5-minute silence timer
+        resetSilenceTimer()
     }
 
     private fun fadeOut() {
-        val curText = textView?.text?.toString() ?: ""
-        CaptionLogger.onOverlayFadeOut("called — text='${curText.take(30)}' backlog=${backlog.size} active=$active")
-
-        // AUTO-RECOVERY: If TTS is still speaking when fadeOut fires,
-        // don't fade — the audio is still going, subtitle should stay visible.
-        if (HindiTtsService.isSpeaking) {
-            CaptionLogger.log("Overlay", "fadeOut BLOCKED — TTS still speaking, keeping subtitle visible")
-            return
-        }
-
+        if (!alive) return
+        silenceToken++  // invalidate any pending reschedule
+        CaptionLogger.onOverlayFadeOut("silence_5min")
         textView?.animate()?.cancel()
-        textView?.animate()?.alpha(0f)?.setDuration(250)
+        textView?.animate()?.alpha(0f)?.setDuration(500)
             ?.withEndAction {
                 textView?.text = ""
                 CaptionLogger.onOverlayGone("fade_complete")
             }?.start()
     }
 
-    private fun cancelAllTimers() {
-        wordRunnable?.let    { handler.removeCallbacks(it) }
-        holdRunnable?.let    { handler.removeCallbacks(it) }
-        silenceRunnable?.let { handler.removeCallbacks(it) }
-        wordRunnable = null; holdRunnable = null; silenceRunnable = null
-    }
-
-    private fun cancelTimers() {
-        // Cancel hold/word timers only — preserves silenceRunnable
-        // Use cancelAllTimers() when you also need to stop the silence timer
-        wordRunnable?.let { handler.removeCallbacks(it) }
-        holdRunnable?.let { handler.removeCallbacks(it) }
-        wordRunnable = null; holdRunnable = null
-    }
-
-    private var silenceGeneration = 0  // incremented on every reschedule to invalidate stale runnables
-
-    private fun reschedSilence() {
-        silenceRunnable?.let { handler.removeCallbacks(it) }
-        silenceRunnable = null
-        val gen = ++silenceGeneration
-        val r = Runnable {
-            if (gen != silenceGeneration) return@Runnable  // stale — a newer one was scheduled
-            val timeSinceLastText = System.currentTimeMillis() - lastTextShownMs
-            if (backlog.isEmpty() && !active && !HindiTtsService.isSpeaking
-                && timeSinceLastText >= 290_000L) {
-                CaptionLogger.log("Overlay", "silence-timer: idle ${timeSinceLastText/1000}s → fade")
-                fadeOut()
-            } else {
-                CaptionLogger.log("Overlay", "silence-timer: active → reschedule", CaptionLogger.LEVEL_DEBUG)
-                reschedSilence()
+    private fun resetSilenceTimer() {
+        val myToken = ++silenceToken
+        handler.postDelayed({
+            if (myToken != silenceToken) return@postDelayed  // newer text arrived
+            if (!alive) return@postDelayed
+            // Only fade if TTS is not currently speaking
+            if (HindiTtsService.isSpeaking) {
+                // TTS still active — postpone fade
+                resetSilenceTimer()
+                return@postDelayed
             }
-        }
-        silenceRunnable = r
-        handler.postDelayed(r, 300_000L)
+            CaptionLogger.log("Overlay", "5min silence — fading out")
+            fadeOut()
+        }, SILENCE_MS)
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
 
     private fun buildOverlay() {
         try {
-            val sw = resources.displayMetrics.widthPixels
             val tv = TextView(this).apply {
                 typeface  = Typeface.DEFAULT_BOLD
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)   // smaller = more words per line
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
                 setTextColor(Color.WHITE)
                 setShadowLayer(12f, 1f, 2f, Color.BLACK)
-                maxLines   = 3                                  // 3 lines ≈ 35-45 Hindi words
+                maxLines   = 3
                 setLineSpacing(2f, 1.1f)
-                // Semi-transparent dark background — words readable over any video
                 setBackgroundColor(android.graphics.Color.argb(160, 0, 0, 0))
                 setPadding(dp(10), dp(6), dp(10), dp(6))
                 alpha = 0f; text = ""
             }
             textView = tv; overlayView = tv
             params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,        // full width
+                WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -375,4 +223,4 @@ class OverlayService : Service() {
             .setContentText("Hindi subtitle overlay running")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true).setSilent(true).build()
-}  // end OverlayService
+}
