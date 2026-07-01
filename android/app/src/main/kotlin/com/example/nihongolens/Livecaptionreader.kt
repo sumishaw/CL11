@@ -179,6 +179,14 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastHindiTime = 0L
     private val HINDI_DEDUP_MS = 4_000L
 
+    // Called by GenderAnalyzer on gender switch — new speaker may say
+    // similar words, so we reset dedup to ensure their sentence always shows
+    fun resetHindiDedup() {
+        lastHindiOut  = ""
+        lastHindiTime = 0L
+        CaptionLogger.log(TAG, "Hindi dedup reset (gender switch)")
+    }
+
     // Language tracking
     private var confirmedLang = ""
     private var pendingLang   = ""
@@ -355,6 +363,7 @@ class LiveCaptionReader : AccessibilityService() {
             lcVisible   = true
             lastRawFull = ""
             lastEnqueuedSents.clear()
+            resetHindiDedup()  // new scene — don't skip new speaker's first sentence
             CaptionLogger.log(TAG, "LC appeared '${full.take(60)}'")
         }
 
