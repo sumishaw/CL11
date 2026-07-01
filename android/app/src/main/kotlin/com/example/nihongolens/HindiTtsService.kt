@@ -145,6 +145,20 @@ object HindiTtsService {
         sentenceF0 = 0f; sentenceGender = Gender.AUTO; f0SentenceBuffer.clear()
     }
 
+    // Called on gender switch — seeds new gender buffer with current F0
+    // so the first sentence after switch gets a real pitch, not the flat 1.0 default
+    fun seedSentenceF0(f0: Float, gender: Gender) {
+        sentenceGender = gender
+        f0SentenceBuffer.clear()
+        if (f0 > 60f) {
+            // Add several copies to give the median enough data immediately
+            repeat(10) { f0SentenceBuffer.add(f0) }
+            sentenceF0 = f0
+            CaptionLogger.log("HindiTTS",
+                "SEED-F0 gender=$gender f0=${f0.toInt()}Hz ratio=${String.format("%.2f", exactPitchRatio(f0, gender == Gender.FEMALE))}")
+        }
+    }
+
         // Stable pitch ratio using EMA F0 — same speaker always sounds consistent
     // ── VoiceProfile → TTS parameter mapping ─────────────────────────────────
     // Called by VoiceAnalyzer every ~2s with updated vocal metrics.
