@@ -637,7 +637,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }).toList();
   }
 
-  Widget _langChip(String label, String code, IconData? icon) {
+  Widget _langChip(String label, String code) {
     final isSelected = _lockedLang == code;
     return GestureDetector(
       onTap: () => _setLockedLang(code),
@@ -654,7 +654,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ),
         child: Row(mainAxisSize: MainAxisSize.min, children: [
-          if (icon != null) ...[Icon(icon, size: 12, color: isSelected ? Colors.blueAccent : Colors.white54), const SizedBox(width: 4)],
           Text(label, style: TextStyle(
             color: isSelected ? Colors.blueAccent : Colors.white70,
             fontSize: 11,
