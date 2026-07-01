@@ -835,15 +835,23 @@ object HindiTtsService {
 
 
     private suspend fun synthesizeToFile(item: FetchItem): File? {
-        // Timeout on mutex acquire — if previous synthesis hung, don't wait forever
-        val acquired = try {
-            withTimeoutOrNull(8_000L) { synthesizeMutex.lock(); true } ?: false
-        } catch (_: Exception) { false }
-        if (!acquired) {
+        // Timeout on mutex acquire — if previous synthesis hung, don't wait forever.
+        // Uses withLock (not manual lock()/unlock()) because withLock is
+        // cancellation-safe: if withTimeoutOrNull cancels while lock() is
+        // resuming, withLock guarantees it never leaves the mutex locked
+        // without an owner. The old manual lock()+finally{unlock()} pattern
+        // had a race where a timeout landing exactly as lock() acquired could
+        // skip the unlock(), permanently wedging the mutex — every future
+        // synthesis call would then time out forever with no way to recover.
+        val result = try {
+            withTimeoutOrNull(8_000L) {
+                synthesizeMutex.withLock { synthesizeToFileInner(item) }
+            }
+        } catch (_: Exception) { null }
+        if (result == null) {
             CaptionLogger.log(TAG, "SYNTH-MUTEX-TIMEOUT: previous synthesis hung, skipping", CaptionLogger.LEVEL_ERROR)
-            return null
         }
-        return try { synthesizeToFileInner(item) } finally { synthesizeMutex.unlock() }
+        return result
     }
 
     private suspend fun synthesizeToFileInner(item: FetchItem): File? =
