@@ -137,6 +137,91 @@ object HindiTtsService {
     }
 
     // Stable pitch ratio using EMA F0 — same speaker always sounds consistent
+    // ── VoiceProfile → TTS parameter mapping ─────────────────────────────────
+    // Called by VoiceAnalyzer every ~2s with updated vocal metrics.
+    // Maps each measured metric directly to Android TTS parameters.
+    @Volatile var voiceProfile: VoiceProfile? = null
+
+    fun applyVoiceProfile(profile: VoiceProfile) {
+        voiceProfile = profile
+        val isFemale = detectedGender == Gender.FEMALE
+
+        // ── Category 1: F0 → pitch ratio (exact measured Hz) ─────────────────
+        // Use measured meanF0 directly — overrides EMA when profile is fresh
+        if (profile.meanF0 > 60f) {
+            val measuredRatio = exactPitchRatio(profile.meanF0, isFemale)
+            // Blend with EMA for stability (EMA still smooths rapid changes)
+            if (emaF0 <= 0f) emaF0 = profile.meanF0
+            else emaF0 = 0.3f * profile.meanF0 + 0.7f * emaF0
+        }
+
+        // ── Category 2: Spectral centroid → pitch brightness trim ────────────
+        // High centroid (bright/young voice) → small pitch up
+        // Low centroid (dark/bass voice) → small pitch down
+        // Reference: female ~2500Hz, male ~1800Hz, deep bass ~1200Hz
+        val centroidRef = if (isFemale) 2500f else 1800f
+        val centroidTrim = ((profile.spectralCentroid - centroidRef) / centroidRef * 0.12f)
+            .coerceIn(-0.15f, 0.15f)
+        centroidPitchTrim = centroidTrim
+
+        // ── Category 2: Spectral flux → TTS rate adjustment ──────────────────
+        // High flux = crisp fast articulation → faster TTS rate
+        // Normalized against expected flux range
+        val fluxRate = when {
+            profile.spectralFlux > 8000f -> 0.15f   // very crisp → +15% rate
+            profile.spectralFlux > 4000f -> 0.08f   // crisp
+            profile.spectralFlux < 1000f -> -0.10f  // slow articulation → -10%
+            else -> 0f
+        }
+        spectralFluxRateAdj = fluxRate
+
+        // ── Category 3: Voice quality → emotion/style selection ──────────────
+        // Jitter + shimmer + HNR together determine voice texture tag
+        val textureEmotion: HindiTtsService.Emotion? = when {
+            profile.jitter > 1.5f && profile.shimmer > 8f ->
+                HindiTtsService.Emotion.GRAVELLY    // raspy/elderly
+            profile.shimmer > 7f && profile.hnr < 14f ->
+                HindiTtsService.Emotion.BREATHY     // breathy/airy
+            profile.hnr < 13f && profile.jitter < 1f ->
+                HindiTtsService.Emotion.WHISPERY    // whispery/soft
+            profile.jitter < 0.4f && profile.hnr > 22f ->
+                null   // very clean voice — no texture override
+            else -> null
+        }
+        // Only apply texture emotion if it's different from current detected emotion
+        if (textureEmotion != null && currentEmotion == HindiTtsService.Emotion.NEUTRAL) {
+            voiceTextureEmotion = textureEmotion
+        } else {
+            voiceTextureEmotion = null
+        }
+
+        // ── Category 4: Syllable rate → TTS base rate ────────────────────────
+        // Measured syllable rate maps directly to TTS speech rate
+        // Reference: natural Hindi speech ~4-5 syllables/sec
+        // Fast speaker (>6/s) → TTS rate up; slow speaker (<3/s) → rate down
+        val syllableRateAdj = when {
+            profile.syllableRate > 6.5f -> 0.20f   // very fast talker
+            profile.syllableRate > 5.5f -> 0.12f   // fast
+            profile.syllableRate < 2.5f -> -0.18f  // very slow
+            profile.syllableRate < 3.5f -> -0.08f  // slow
+            else -> 0f                              // normal pace
+        }
+        syllableRateAdjustment = syllableRateAdj
+
+        CaptionLogger.log("HindiTTS",
+            "PROFILE-APPLIED: pitch=${if (emaF0>0f) emaF0.toInt() else 0}Hz " +
+            "centrimTrim=${"%.2f".format(centroidTrim)} " +
+            "fluxAdj=${"%.2f".format(fluxRate)} " +
+            "syllAdj=${"%.2f".format(syllableRateAdj)} " +
+            "texture=$textureEmotion")
+    }
+
+    // Profile-derived adjustments applied in speak()
+    @Volatile var centroidPitchTrim:    Float = 0f
+    @Volatile var spectralFluxRateAdj:  Float = 0f
+    @Volatile var syllableRateAdjustment: Float = 0f
+    @Volatile var voiceTextureEmotion: HindiTtsService.Emotion? = null
+
     fun stablePitchRatio(isFemale: Boolean): Float = when {
         emaF0 > 0f -> exactPitchRatio(emaF0, isFemale)
         currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)
@@ -387,7 +472,7 @@ object HindiTtsService {
         val genderTag = if (isFemale) "female" else "male"
 
         // Emotion → pitch/rate adjustments
-        val (pitchMult, rateMult) = emotionPitchRate(currentEmotion)
+        // pitchMult/rateMult now computed below using effectiveEmotion (includes VoiceProfile texture)
 
         // EXACT MIRRORING: instead of approximating the gender with a fixed
         // basePitch, use the speaker's EXACT measured F0 to compute a precise
@@ -406,8 +491,20 @@ object HindiTtsService {
             else                   -> 0.88f
         }
 
-        val finalPitch = (basePitch * pitchMult).coerceIn(0.5f, 2.0f)
-        val finalRate  = (ttsSpeedMultiplier * rateMult).coerceIn(0.5f, 3.0f)
+        // Apply VoiceProfile-derived adjustments on top of base pitch/rate
+        // centroidPitchTrim: spectral brightness offset (high centroid = brighter pitch)
+        // syllableRateAdjustment: measured speaking speed → TTS rate
+        // spectralFluxRateAdj: articulation crispness → rate
+        val profilePitch = basePitch + centroidPitchTrim
+        val profileRate  = ttsSpeedMultiplier + syllableRateAdjustment + spectralFluxRateAdj
+
+        // Use voiceTextureEmotion if active and no other emotion detected
+        val effectiveEmotion = if (voiceTextureEmotion != null && currentEmotion == Emotion.NEUTRAL)
+            voiceTextureEmotion!! else currentEmotion
+        val (pitchMult2, rateMult2) = emotionPitchRate(effectiveEmotion)
+
+        val finalPitch = (profilePitch * pitchMult2).coerceIn(0.5f, 2.0f)
+        val finalRate  = (profileRate  * rateMult2).coerceIn(0.5f, 3.0f)
 
         // Snapshot background music sequence at enqueue time for timing alignment
         val bgSeq = BackgroundMusicRecorder.currentSeq.get()
