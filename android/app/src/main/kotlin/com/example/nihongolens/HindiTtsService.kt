@@ -81,6 +81,14 @@ object HindiTtsService {
     // frame-to-frame) — same cadence as currentVoiceType, just continuous.
     @Volatile var currentMeasuredF0: Float = 0f   // 0 = no measurement yet
 
+    // ── Captured F0 contour for SSML prosody ─────────────────────────────────
+    // Written by GenderAnalyzer.flushContour() just before each sentence is
+    // enqueued. speak() reads these to build SSML that mirrors the original
+    // speaker's intonation shape (rising/falling/peaked/flat).
+    @Volatile var capturedStartF0: Float = 0f
+    @Volatile var capturedPeakF0:  Float = 0f
+    @Volatile var capturedEndF0:   Float = 0f
+
     // Android TTS "natural" reference F0 — the approximate average speaking
     // pitch of the underlying recorded voice corpus when pitch=1.0 (no shift).
     // These are empirical reference points for Google TTS hi-IN voices.
@@ -474,6 +482,83 @@ object HindiTtsService {
     }
     // ── Android TTS synthesize to file (async with coroutine bridge) ──────────
 
+    // ── SSML builder: wraps Hindi text in prosody tags that mirror original F0 ──
+    // Splits text into word-groups and assigns a pitch tag to each group based
+    // on where it falls in the start→peak→end contour of the original utterance.
+    // Android TTS supports SSML <speak><prosody pitch='...'> natively.
+    //
+    // Contour shapes:
+    //   RISING  (endF0 > startF0): statement that trails up — question-like
+    //   FALLING (endF0 < startF0): statement, conclusion — confident, definitive
+    //   PEAKED  (peakF0 >> startF0 & endF0): emphasis in the middle
+    //   FLAT    (all similar): calm, neutral — minimal prosody tags
+    //
+    private fun buildSsml(text: String, basePitch: Float,
+                           startF0: Float, peakF0: Float, endF0: Float,
+                           naturalF0: Float): String {
+
+        // Convert absolute F0 values to percentage offsets from TTS baseline
+        fun f0ToPct(f0: Float): String {
+            if (f0 <= 0f) return "+0%"
+            val ratio = (f0 / naturalF0) * basePitch
+            val pct   = ((ratio - 1.0f) * 100f).toInt().coerceIn(-50, 80)
+            return if (pct >= 0) "+${pct}%" else "${pct}%"
+        }
+
+        val startPct = f0ToPct(startF0)
+        val peakPct  = f0ToPct(peakF0)
+        val endPct   = f0ToPct(endF0)
+
+        // Determine contour type
+        val rising  = endF0 > 0f && startF0 > 0f && endF0 > startF0 * 1.08f
+        val falling = endF0 > 0f && startF0 > 0f && endF0 < startF0 * 0.92f
+        val peaked  = peakF0 > 0f && startF0 > 0f && peakF0 > startF0 * 1.15f &&
+                      (endF0 <= 0f || endF0 < peakF0 * 0.90f)
+        val flat    = !rising && !falling && !peaked
+
+        // No contour data → simple flat SSML with just the base pitch
+        if (startF0 <= 0f && peakF0 <= 0f && endF0 <= 0f || flat) {
+            val bPct = f0ToPct(if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
+            return "<speak><prosody pitch='$bPct'>${android.text.Html.escapeHtml(text)}</prosody></speak>"
+        }
+
+        // Split into 3 sections: beginning / middle / end
+        val words  = text.split(" ").filter { it.isNotBlank() }
+        val n      = words.size
+        if (n < 3) {
+            // Too short to split — use peak pitch for single/double word
+            val p = if (peaked) peakPct else if (rising) endPct else startPct
+            return "<speak><prosody pitch='$p'>${android.text.Html.escapeHtml(text)}</prosody></speak>"
+        }
+
+        val cut1 = n / 3
+        val cut2 = 2 * n / 3
+        val seg1 = words.subList(0, cut1).joinToString(" ")
+        val seg2 = words.subList(cut1, cut2).joinToString(" ")
+        val seg3 = words.subList(cut2, n).joinToString(" ")
+
+        fun esc(s: String) = android.text.Html.escapeHtml(s)
+
+        return when {
+            rising  -> "<speak>" +
+                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
+                "<prosody pitch='${f0ToPct((startF0+endF0)/2)}'>${esc(seg2)}</prosody> " +
+                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
+                "</speak>"
+            falling -> "<speak>" +
+                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
+                "<prosody pitch='${f0ToPct((startF0+endF0)/2)}'>${esc(seg2)}</prosody> " +
+                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
+                "</speak>"
+            peaked  -> "<speak>" +
+                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
+                "<prosody pitch='$peakPct'>${esc(seg2)}</prosody> " +
+                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
+                "</speak>"
+            else    -> "<speak><prosody pitch='$startPct'>${esc(text)}</prosody></speak>"
+        }
+    }
+
     private suspend fun synthesizeToFile(item: FetchItem): File? =
         synthesizeMutex.withLock {
             withContext(Dispatchers.IO) {
@@ -499,6 +584,25 @@ object HindiTtsService {
             localTts.setSpeechRate(item.rate)
             localTts.setPitch(item.pitch)
 
+            // Build SSML from captured F0 contour when available
+            // SSML gives word-group level pitch variation instead of one flat pitch
+            val naturalF0 = if (item.gender == "female") TTS_NATURAL_F0_FEMALE else TTS_NATURAL_F0_MALE
+            val hasCapturedContour = capturedStartF0 > 0f || capturedPeakF0 > 0f
+            val inputText: String
+            val inputBundle: android.os.Bundle?
+            if (hasCapturedContour) {
+                inputText = buildSsml(item.text, item.pitch,
+                    capturedStartF0, capturedPeakF0, capturedEndF0, naturalF0)
+                inputBundle = android.os.Bundle().apply {
+                    putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
+                }
+                CaptionLogger.log(TAG, "SSML: start=${capturedStartF0.toInt()} " +
+                    "peak=${capturedPeakF0.toInt()} end=${capturedEndF0.toInt()}Hz")
+            } else {
+                inputText   = item.text
+                inputBundle = null
+            }
+
             // Bridge Android TTS callback to coroutine
             val id = UUID.randomUUID().toString()
             val deferred = CompletableDeferred<Unit>()
@@ -507,8 +611,8 @@ object HindiTtsService {
 
             try {
                 val result = localTts.synthesizeToFile(
-                    item.text,
-                    null,
+                    inputText,
+                    inputBundle,
                     outFile,
                     id
                 )
