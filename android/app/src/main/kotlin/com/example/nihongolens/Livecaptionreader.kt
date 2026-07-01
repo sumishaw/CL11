@@ -38,7 +38,8 @@ class LiveCaptionReader : AccessibilityService() {
         // 3s: enough for user to dismiss and return to video.
         // If LC stays gone > 3s → video genuinely ended/paused → confirm gone.
         private const val LC_GONE_GRACE_MS  = 3_000L
-        private const val LANG_CONFIRM     = 3
+        private const val LANG_CONFIRM        = 3
+        private const val LANG_CONFIRM_LOCKED  = 999  // never switches when locked
         private const val QUEUE_CAP        = 500  // never flush while running — FIFO backlog
         private const val STALE_MS         = Long.MAX_VALUE  // backlogs NEVER expire while running
 
@@ -190,11 +191,7 @@ class LiveCaptionReader : AccessibilityService() {
     // "latin_en" | "ja" | "zh" | "ko" | "ar" | "ru" | "hi" | "latin_foreign" = locked
     @Volatile var lockedLang: String = ""
 
-    // Raise confirm threshold when NOT locked — 3 consecutive detections needed
-    // to switch language. Prevents single-word misdetection from triggering switch.
-    // When locked, detection is bypassed entirely.
-    private const val LANG_CONFIRM_LOCKED = 999   // effectively never switches when locked
-    private val effectiveLangConfirm get() = if (lockedLang.isNotEmpty()) LANG_CONFIRM_LOCKED else LANG_CONFIRM
+    // When locked, bypass detection entirely (if (lockedLang.isNotEmpty()) LANG_CONFIRM_LOCKED else LANG_CONFIRM not needed)
 
     // Window state
     private var lastRawFull           = ""
