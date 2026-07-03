@@ -874,7 +874,17 @@ object HindiTtsService {
             }
 
             val targetPct  = basePct + deviationPct
-            val steppedPct = prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
+            // FIX: word 0 previously started the smoothing from a FIXED
+            // baseline (basePct/100%) regardless of its own true target,
+            // then spent the next several words' step-cap budget "catching
+            // up" to wherever the real per-word values actually were. Since
+            // this reset identically at the start of EVERY sentence, it
+            // produced the exact same slow→medium→fast ramp shape on every
+            // single utterance, regardless of actual content — there's no
+            // legitimate "previous word" to smooth from at i==0, so it
+            // should just take its own real target directly.
+            val steppedPct = if (i == 0) targetPct
+                             else prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
             prevPct = steppedPct
             val pctStr = if (steppedPct >= 0) "+${steppedPct.toInt()}%" else "${steppedPct.toInt()}%"
 
@@ -884,7 +894,10 @@ object HindiTtsService {
             // Small effect (85-115%) so it nudges pacing without sounding
             // choppy — "word-by-word pacing," not a dramatic rate swing.
             val targetRatePct  = (100f - (energyRatio * 15f)).coerceIn(85f, 115f)
-            val steppedRatePct = prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
+            // Same fix as pitch above — word 0 takes its true target rate
+            // directly instead of ramping in from a fixed 100% baseline.
+            val steppedRatePct = if (i == 0) targetRatePct
+                                 else prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
             prevRatePct = steppedRatePct
             val ratePctStr = "${steppedRatePct.toInt()}%"
 
@@ -973,7 +986,12 @@ object HindiTtsService {
             }
 
             val targetPct  = basePct + deviationPct
-            val steppedPct = prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
+            // Same fix as buildMelodyContour — word 0 takes its true target
+            // directly instead of ramping in from a fixed baseline every
+            // single sentence (see the comment there for the full
+            // explanation of the bug this caused).
+            val steppedPct = if (i == 0) targetPct
+                             else prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
             prevPct = steppedPct
             val pctStr = if (steppedPct >= 0) "+${steppedPct.toInt()}%" else "${steppedPct.toInt()}%"
 
@@ -982,7 +1000,8 @@ object HindiTtsService {
             // gets sped up slightly — the closest available proxy for "this
             // syllable was held longer" without real duration control.
             val targetRatePct  = (100f - (sustainScore * 25f)).coerceIn(70f, 115f)
-            val steppedRatePct = prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
+            val steppedRatePct = if (i == 0) targetRatePct
+                                 else prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
             prevRatePct = steppedRatePct
             val ratePctStr = "${steppedRatePct.toInt()}%"
 
