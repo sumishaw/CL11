@@ -213,8 +213,32 @@ object HindiTtsService {
     @Volatile var capturedStartF0: Float = 0f   // legacy 3-point (fallback)
     @Volatile var capturedPeakF0:  Float = 0f
     @Volatile var capturedEndF0:   Float = 0f
-    val capturedF0Curve  = FloatArray(10)  // 10-point F0 across sentence duration
-    val capturedRmsCurve = FloatArray(10)  // 10-point RMS (energy) across sentence
+    // Size MUST match GenderAnalyzer.CONTOUR_POINTS exactly — flushContour()
+    // writes into these via copyInto(), which throws if sizes don't match.
+    val capturedF0Curve  = FloatArray(GenderAnalyzer.CONTOUR_POINTS)  // F0 across sentence duration
+    val capturedRmsCurve = FloatArray(GenderAnalyzer.CONTOUR_POINTS)  // RMS (energy) across sentence
+
+    // ── Voice Mimic Engine: vibrato + breath (published by flushContour()) ────
+    // Vibrato is DETECTED from the original voice but cannot be truly
+    // REPRODUCED — Android TTS has no pitch-oscillation API at all. Consumers
+    // of capturedVibratoDetected should treat it as "apply a coarse pitch
+    // wobble approximation," not "reproduce real vibrato."
+    @Volatile var capturedVibratoDetected: Boolean = false
+    @Volatile var capturedVibratoRateHz:   Float   = 0f
+    // Count of likely breath pauses detected in the ORIGINAL audio this
+    // sentence. Does NOT map to specific positions in the Hindi translation
+    // (translated word count/order/timing doesn't correspond 1:1 to the
+    // source) — consumers should distribute this many short pauses roughly
+    // evenly through the translated sentence, not treat it as precise
+    // alignment.
+    @Volatile var capturedBreathCount: Int = 0
+
+    // Emotion blending state (see the blend computation in speak() for
+    // details) — must persist across calls, since each sentence blends
+    // toward its target from the PREVIOUS sentence's value.
+    @Volatile private var prevBlendedPitch: Float = 0f  // 0f sentinel = "not set yet"
+    @Volatile private var prevBlendedRate:  Float = 0f
+    @Volatile private var prevBlendGenderTag: String = ""
 
     // Android TTS "natural" reference F0 — the approximate average speaking
     // pitch of the underlying recorded voice corpus when pitch=1.0 (no shift).
@@ -517,14 +541,39 @@ object HindiTtsService {
         val finalPitch = (profilePitch * pitchMult2).coerceIn(0.75f, 1.45f)  // stay in natural range
         val finalRate  = (profileRate  * rateMult2).coerceIn(0.5f, 3.0f)
 
+        // ── Emotion blending ───────────────────────────────────────────────────
+        // Smooths pitch/rate toward the new target across consecutive
+        // sentences instead of jumping instantly — a hard jump when emotion
+        // changes abruptly (e.g. NEUTRAL → EXCITED between two sentences)
+        // can sound jarring. Blends 60% toward the target per sentence
+        // (reaches the correct value within 1-2 sentences, not stuck lagging
+        // forever). Snaps directly with NO blending on the very first
+        // utterance ever, or immediately after a speaker/gender switch —
+        // in both cases there's no legitimate previous value to blend from,
+        // and blending from a stale/default value would undershoot the
+        // correct target for that first sentence.
+        val isNewSpeakerOrFirst = prevBlendedPitch <= 0f || genderTag != prevBlendGenderTag
+        val blendedPitch: Float
+        val blendedRate: Float
+        if (isNewSpeakerOrFirst) {
+            blendedPitch = finalPitch
+            blendedRate  = finalRate
+        } else {
+            blendedPitch = prevBlendedPitch + (finalPitch - prevBlendedPitch) * 0.6f
+            blendedRate  = prevBlendedRate  + (finalRate  - prevBlendedRate)  * 0.6f
+        }
+        prevBlendedPitch   = blendedPitch
+        prevBlendedRate    = blendedRate
+        prevBlendGenderTag = genderTag
+
         // Snapshot background music sequence at enqueue time for timing alignment
         val bgSeq = BackgroundMusicRecorder.currentSeq.get()
 
-        CaptionLogger.log(TAG, "SPEAK emo=$currentEmotion spd=${String.format("%.2f", finalRate)} " +
-            "pitch=${String.format("%.2f", finalPitch)} $genderTag " +
+        CaptionLogger.log(TAG, "SPEAK emo=$currentEmotion spd=${String.format("%.2f", blendedRate)} " +
+            "pitch=${String.format("%.2f", blendedPitch)} $genderTag " +
             "F0=${currentMeasuredF0.toInt()}Hz voiceType=$currentVoiceType bg=$bgSeq '${n.take(50)}'")
 
-        fetchQueue.offer(FetchItem(n, genderTag, finalPitch, finalRate, srcText,
+        fetchQueue.offer(FetchItem(n, genderTag, blendedPitch, blendedRate, srcText,
             currentEmotion, bgSeq, System.currentTimeMillis()))
     }
 
@@ -697,7 +746,7 @@ object HindiTtsService {
     // snapping to it — keeps the real rising/falling direction without the
     // jumpiness. The deviation is also scaled down (0.6x) so it nudges the
     // already-correct base pitch rather than exaggerating it.
-    private fun buildMelodyContour(text: String, curve: FloatArray, basePitchPct: String): String? {
+    private fun buildMelodyContour(text: String, curve: FloatArray, rmsCurve: FloatArray, basePitchPct: String): String? {
         val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.size < 2) return null   // too short for a contour to matter
 
@@ -707,20 +756,59 @@ object HindiTtsService {
         val meanF0 = validPts.average().toFloat()
         if (meanF0 <= 0f) return null
 
+        val validRms = rmsCurve.filter { it > 0f }
+        val meanRms  = if (validRms.isNotEmpty()) validRms.average().toFloat() else 0f
+
         val basePct = basePitchPct.removeSuffix("%").toFloatOrNull() ?: 0f
         val maxStepPct = 6f   // cap per-word change to avoid staircase jumps
         var prevPct = basePct
 
+        // Breath-based pauses: distribute capturedBreathCount short breaks
+        // roughly evenly across the word sequence. This is a genuine
+        // approximation, not precise alignment — see the field's own comment
+        // for why exact positioning isn't achievable (translated word
+        // count/order/timing doesn't map 1:1 to the source audio).
+        val breathCount = capturedBreathCount.coerceIn(0, words.size - 1)
+        val breathAfterWordIdx: Set<Int> = if (breathCount > 0) {
+            (1..breathCount).map { (it * words.size / (breathCount + 1)) }.toSet()
+        } else emptySet()
+
+        // Vibrato wobble: HONEST APPROXIMATION ONLY. Android TTS has no real
+        // pitch-oscillation control — this alternates a small +/- pitch
+        // nudge word-to-word to hint at "some pitch movement was here" when
+        // the original voice had genuine vibrato. It is not, and cannot be,
+        // actual vibrato reproduction.
+        val applyVibratoWobble = capturedVibratoDetected
+
         val tagged = words.mapIndexed { i, w ->
-            val curveIdx = ((i.toFloat() / (words.size - 1).coerceAtLeast(1)) * 9f)
-                .toInt().coerceIn(0, 9)
+            val curveIdx = ((i.toFloat() / (words.size - 1).coerceAtLeast(1)) * (curve.size - 1))
+                .toInt().coerceIn(0, curve.size - 1)
             val rawF0 = curve[curveIdx]
-            val deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 0.6f) else 0f
+            var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 0.6f) else 0f
+
+            // Energy matching: words spoken louder than the sentence's own
+            // average get a small extra lift, quieter words a small dip —
+            // nudges emphasis toward where the original speaker actually
+            // pushed energy, using the already-captured RMS curve.
+            if (meanRms > 0f && curveIdx < rmsCurve.size) {
+                val rawRms = rmsCurve[curveIdx]
+                if (rawRms > 0f) {
+                    val energyRatio = (rawRms - meanRms) / meanRms
+                    deviationPct += (energyRatio * 8f).coerceIn(-6f, 6f)
+                }
+            }
+
+            if (applyVibratoWobble) {
+                deviationPct += if (i % 2 == 0) 2.5f else -2.5f
+            }
+
             val targetPct  = basePct + deviationPct
             val steppedPct = prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
             prevPct = steppedPct
             val pctStr = if (steppedPct >= 0) "+${steppedPct.toInt()}%" else "${steppedPct.toInt()}%"
-            "<prosody pitch='$pctStr'>${android.text.Html.escapeHtml(w)}</prosody>"
+
+            val wordTag = "<prosody pitch='$pctStr'>${android.text.Html.escapeHtml(w)}</prosody>"
+            if (i in breathAfterWordIdx) "$wordTag<break time='180ms'/>" else wordTag
         }.joinToString(" ")
 
         return "<speak><prosody rate='medium'>$tagged</prosody></speak>"
@@ -929,7 +1017,7 @@ object HindiTtsService {
                 "<speak><prosody rate='medium'>$tagged</prosody></speak>"
             }
             else -> if (emotion == Emotion.NEUTRAL) null
-                    else buildMelodyContour(text, capturedF0Curve, basePitchPct)
+                    else buildMelodyContour(text, capturedF0Curve, capturedRmsCurve, basePitchPct)
             // NEUTRAL stays on the plain setPitch()/setSpeechRate() path —
             // it's the majority of ordinary dialogue, and per-word SSML
             // pitch tags are exactly what the file's own comments warn
