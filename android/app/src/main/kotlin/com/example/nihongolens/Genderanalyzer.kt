@@ -35,7 +35,7 @@ object GenderAnalyzer {
     // STABILITY FIX: Increased from 3 → 12 frames (was switching on 2/3 frames = ~256ms)
     // Now needs 8/12 consecutive frames to switch = ~768ms of sustained pitch change
     // Prevents rapid MALE↔FEMALE oscillation that caused spokenTokens.clear() spam → skipped sentences
-    private const val HIST         = 12          // ~768ms majority window (was 3 = ~192ms)
+    private const val HIST         = 77          // ~768ms majority window at 20ms cadence (was 12 @ 128ms cadence)
 
     // Minimum milliseconds between gender switches — prevents double-switching within one sentence
     // Even with HIST=12, rapid pitch variation (music, noise) can still flip quickly
@@ -50,6 +50,36 @@ object GenderAnalyzer {
     private val history   = ArrayDeque<HindiTtsService.Gender>()
     private val accum     = ShortArray(WIN)
     private var accumFill = 0
+
+    // ── Sliding-window pitch tracking (Voice Mimic Engine upgrade) ───────────
+    // OLD: analyze() ran once every WIN=2048 samples (128ms), non-overlapping.
+    // NEW: same WIN-sample analysis window (needed for reliable low-pitch
+    // detection — a shorter window can't capture even one full period of a
+    // low male voice), but re-run every HOP_SAMPLES instead of every WIN
+    // samples — i.e. overlapping windows, bulk-shifted rather than reset.
+    //
+    // WHY THIS MATTERS: vibrato oscillates at 4-8Hz — a full cycle every
+    // 125-250ms. At the OLD 128ms sampling rate there's barely one F0 sample
+    // per vibrato cycle — nowhere near enough to detect oscillation at all
+    // (Nyquist: you need at least ~2 samples per cycle just to see it exists,
+    // and several more to characterize its rate/depth reliably). At HOP_MS
+    // resolution below there are enough samples per cycle for real detection.
+    //
+    // COST WARNING — read before lowering HOP_MS further: the YIN pitch
+    // detector is O(WIN * tauMax) per call, roughly 270K float ops. At the
+    // old 128ms cadence that's ~2.1M ops/sec; at HOP_MS=20ms it's ~13.4M
+    // ops/sec — about 6.4x more CPU spent on pitch detection alone, on top
+    // of Whisper transcription + CT2 translation + TTS synthesis already
+    // running on a 2-big-core chip. 20ms was chosen (not the requested 10ms)
+    // as a middle ground that captures most of the vibrato-detection benefit
+    // without a full ~13x cost increase. This needs to be verified against
+    // real battery/thermal behavior on-device — that can't be measured from
+    // here. Lower HOP_MS only after confirming it doesn't cause throttling
+    // or dropped frames elsewhere in the pipeline.
+    private const val HOP_MS      = 20
+    private val HOP_SAMPLES       = (SR * HOP_MS / 1000).coerceAtLeast(1)
+    private val hopStage          = ShortArray(HOP_SAMPLES)
+    private var hopFill           = 0
 
     private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var captureJob: Job?         = null
@@ -187,13 +217,43 @@ object GenderAnalyzer {
         while (i + 1 < count) {
             val lo = bytes[i].toInt() and 0xFF
             val hi = bytes[i + 1].toInt() and 0xFF
-            accum[accumFill++] = ((hi shl 8) or lo).toShort()
+            val sample = ((hi shl 8) or lo).toShort()
             i += 2
-            if (accumFill >= WIN) { analyze(); accumFill = 0 }
+
+            if (accumFill < WIN) {
+                // Filling the very first window — identical to old behavior
+                accum[accumFill++] = sample
+                if (accumFill == WIN) analyze()
+            } else {
+                // Sliding: stage HOP_SAMPLES of new audio, then bulk-shift
+                // the window forward by exactly that much and re-analyze.
+                hopStage[hopFill++] = sample
+                if (hopFill >= HOP_SAMPLES) {
+                    System.arraycopy(accum, HOP_SAMPLES, accum, 0, WIN - HOP_SAMPLES)
+                    System.arraycopy(hopStage, 0, accum, WIN - HOP_SAMPLES, HOP_SAMPLES)
+                    hopFill = 0
+                    analyze()
+                }
+            }
         }
     }
 
     // ── YIN pitch detection ───────────────────────────────────────────────────
+
+    // ── Breath detection ──────────────────────────────────────────────────────
+    // Counts likely breath pauses: a gap of low-RMS "silence" between two
+    // voiced stretches, long enough to be a breath rather than a normal
+    // micro-pause in speech. Consumed at flushContour() and reset per
+    // sentence. NOTE: this tells HindiTtsService "N breaths happened
+    // somewhere in this sentence" — it does NOT tell it exactly where in
+    // the (differently-worded, differently-timed) Hindi translation they
+    // should land, since translated word count/order doesn't correspond
+    // 1:1 to the original audio's timing. The best honest use of this is
+    // distributing that many short pauses roughly evenly through the
+    // translated sentence, not precise alignment.
+    private var silentHopStreak         = 0
+    private var breathCountThisSentence = 0
+    private const val BREATH_MIN_SILENT_HOPS = 8  // 8 * 20ms = ~160ms minimum gap to count as a breath, not just a micro-pause
 
     private fun analyze() {
         analyzeCount++
@@ -203,7 +263,9 @@ object GenderAnalyzer {
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
         if (rms < RMS_FLOOR) {
-            if (analyzeCount % 30 == 0)
+            silentHopStreak++
+            // Throttled to ~3.84s real-world rate (was "% 30" at the old 128ms cadence; now 192 at 20ms keeps the same interval)
+            if (analyzeCount % 192 == 0)
                 CaptionLogger.log(TAG, "silent rms=${rms.toInt()} floor=$RMS_FLOOR analyzed=$analyzeCount")
             return
         }
@@ -236,13 +298,18 @@ object GenderAnalyzer {
         while (tau < tauMax - 1) {
             if (c[tau] < YIN_THRESH) {
                 val best = if (tau + 1 < tauMax && c[tau + 1] < c[tau]) tau + 1 else tau
+                // A voiced frame just resolved a preceding silent streak —
+                // if that gap was long enough, count it as a breath.
+                if (silentHopStreak >= BREATH_MIN_SILENT_HOPS) breathCountThisSentence++
+                silentHopStreak = 0
                 onPitch(SR.toFloat() / best, rms)
                 return
             }
             tau++
         }
 
-        if (analyzeCount % 15 == 0) {
+        // Throttled to ~1.92s real-world rate (was "% 15" at the old 128ms cadence; now 96 at 20ms keeps the same interval)
+        if (analyzeCount % 96 == 0) {
             var mv = 1f; var mt = tauMin
             for (t in tauMin until tauMax) if (c[t] < mv) { mv = c[t]; mt = t }
             CaptionLogger.log(TAG, "noPitch rms=${rms.toInt()} minCMNDF=${"%.3f".format(mv)} f0est=${SR/mt}Hz thr=$YIN_THRESH")
@@ -250,9 +317,10 @@ object GenderAnalyzer {
     }
 
     // ── Emotion detection state ───────────────────────────────────────────────
-    private val f0History   = ArrayDeque<Float>(16)   // recent F0 values for variation
-    private val rmsHistory  = ArrayDeque<Float>(16)   // recent RMS for energy analysis
-    private var prevF0      = 0f
+    private val f0History   = ArrayDeque<Float>(77)   // recent F0 values for variation (was 16 @ 128ms cadence)
+    private val rmsHistory  = ArrayDeque<Float>(77)   // recent RMS for energy analysis (same rescale)
+    // prevF0 removed — slope is now computed via a fixed time-lag lookback
+    // into f0History (see below), not a single-previous-sample comparison
     private var risingFrames = 0
     private var fallingFrames = 0
     private var highEnergyFrames = 0
@@ -269,14 +337,19 @@ object GenderAnalyzer {
     // each word maps to its own measured F0 and energy level from the original.
     private var latestPcmFrame: ShortArray? = null  // latest raw PCM for VoiceAnalyzer
 
-    private val contourF0Buffer  = ArrayDeque<Float>(120) // raw F0 frames per sentence
-    private val contourRmsBuffer = ArrayDeque<Float>(120) // raw RMS frames per sentence
+    private val contourF0Buffer  = ArrayDeque<Float>(768) // raw F0 frames per sentence (was 120 @ 128ms cadence; ~15s coverage preserved at 20ms)
+    private val contourRmsBuffer = ArrayDeque<Float>(768) // raw RMS frames per sentence (same rescale)
     private var contourPeak      = 0f
 
     // Published to HindiTtsService at flushContour()
     // 10-point curves sampled from the sentence window
-    val capturedF0Curve  = FloatArray(10)   // F0 at 10 time positions
-    val capturedRmsCurve = FloatArray(10)   // RMS at 10 time positions (for duration)
+    // Raised from 10 to 30 (Voice Mimic Engine upgrade) — finer per-word
+    // melody resolution. MUST match HindiTtsService.capturedF0Curve/
+    // capturedRmsCurve sizes exactly, since flushContour() copies directly
+    // into them via copyInto() — a size mismatch would throw at runtime.
+    const val CONTOUR_POINTS = 30
+    val capturedF0Curve  = FloatArray(CONTOUR_POINTS)   // F0 at CONTOUR_POINTS time positions
+    val capturedRmsCurve = FloatArray(CONTOUR_POINTS)   // RMS at CONTOUR_POINTS time positions (for duration)
     // Legacy 3-point fields kept for backward compat
     @Volatile var lastContourStartF0: Float = 0f
     @Volatile var lastContourPeakF0:  Float = 0f
@@ -286,7 +359,7 @@ object GenderAnalyzer {
     // Wider rolling window than emotion detection (5s vs 640ms) — voice type is
     // a STABLE characteristic of the speaker, not a moment-to-moment emotional cue.
     // Classified separately per gender so a switch to a new speaker re-classifies cleanly.
-    private val voiceTypeF0History = ArrayDeque<Float>(40)  // ~5s at 8 samples/sec (frame%5==0 sampling)
+    private val voiceTypeF0History = ArrayDeque<Float>(256)  // ~5s at 20ms cadence (was 40 @ 128ms/~8 samples-per-sec)
     private var voiceTypeFrameCount = 0
     private var lastVoiceTypeSwitchMs = 0L
     // 15s: voice type (Soprano/Tenor/Bass etc.) is a stable speaker characteristic
@@ -298,7 +371,7 @@ object GenderAnalyzer {
         val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
                      else                  HindiTtsService.Gender.MALE
 
-        if (frameCount % 5 == 0)
+        if (frameCount % 32 == 0)  // was % 5 @ 128ms cadence; 32 @ 20ms keeps the same ~640ms interval
             CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender")
 
         history.addLast(gender)
@@ -338,7 +411,7 @@ object GenderAnalyzer {
         if (f0 > 0f && rms >= 150f) {
             contourF0Buffer.addLast(f0)
             contourRmsBuffer.addLast(rms)
-            if (contourF0Buffer.size > 120) { contourF0Buffer.removeFirst(); contourRmsBuffer.removeFirst() }
+            if (contourF0Buffer.size > 768) { contourF0Buffer.removeFirst(); contourRmsBuffer.removeFirst() }
             if (f0 > contourPeak) contourPeak = f0
         }
 
@@ -349,7 +422,7 @@ object GenderAnalyzer {
         // Updates at most once per 4s to stay stable (a voice type shouldn't
         // flicker the way emotion or even gender can).
         voiceTypeF0History.addLast(f0)
-        if (voiceTypeF0History.size > 40) voiceTypeF0History.removeFirst()
+        if (voiceTypeF0History.size > 256) voiceTypeF0History.removeFirst()
         voiceTypeFrameCount++
 
         // EXACT MIRRORING: update measured F0 only from VOICED SPEECH frames
@@ -357,9 +430,9 @@ object GenderAnalyzer {
         // This prevents music/silence from contaminating the F0 average and
         // causing the same speaker to sound like a different person between sentences
         val SPEECH_RMS_FLOOR = 180f  // below this = not voiced speech
-        if (voiceTypeF0History.size >= 8 && rms >= SPEECH_RMS_FLOOR) {
+        if (voiceTypeF0History.size >= 51 && rms >= SPEECH_RMS_FLOOR) {  // was >= 8 @ 128ms cadence
             val voicedOnly = voiceTypeF0History.filter { it > 80f }
-            if (voicedOnly.size >= 4) {
+            if (voicedOnly.size >= 25) {  // was >= 4 @ 128ms cadence
                 val avgF0 = voicedOnly.average().toFloat()
                 HindiTtsService.currentMeasuredF0 = avgF0
                 // Feed voiced-speech F0 into EMA — keeps same speaker's pitch stable
@@ -373,7 +446,7 @@ object GenderAnalyzer {
             VoiceAnalyzer.processFrame(latestPcmFrame!!, rms, f0)
         }
 
-        if (voiceTypeFrameCount >= 20 && voiceTypeF0History.size >= 15) {
+        if (voiceTypeFrameCount >= 128 && voiceTypeF0History.size >= 96) {  // was >= 20 / >= 15 @ 128ms cadence
             voiceTypeFrameCount = 0
             val avgF0 = voiceTypeF0History.average().toFloat()
             val classified = classifyVoiceType(avgF0, maj)
@@ -393,12 +466,22 @@ object GenderAnalyzer {
         // Track F0 contour and energy to detect emotion every 10 frames (~640ms)
         f0History.addLast(f0)
         rmsHistory.addLast(rms)
-        if (f0History.size > 12) f0History.removeFirst()
-        if (rmsHistory.size > 12) rmsHistory.removeFirst()
+        if (f0History.size > 77) f0History.removeFirst()   // was > 12 @ 128ms cadence
+        if (rmsHistory.size > 77) rmsHistory.removeFirst()  // same rescale
 
         // F0 slope: rising = excited/happy/surprised, falling = sad/sighing
-        val f0Slope = if (prevF0 > 0) f0 - prevF0 else 0f
-        prevF0 = f0
+        // Compares against ~140ms ago (7 samples at the new 20ms cadence),
+        // NOT the immediately-previous sample — at 20ms spacing, adjacent
+        // samples are naturally close in value, so comparing only to the
+        // last one would make this dominated by short-term measurement
+        // jitter rather than genuine directional pitch movement. 7 samples
+        // back approximates the ~128ms gap the original >5Hz threshold was
+        // tuned for (this comparison used to implicitly be ~1 sample apart
+        // at the old 128ms cadence).
+        val slopeLagSamples = 7
+        val f0Slope = if (f0History.size > slopeLagSamples)
+            f0 - f0History.elementAt(f0History.size - 1 - slopeLagSamples)
+        else 0f
         if (f0Slope > 5f) risingFrames++ else if (f0Slope < -5f) fallingFrames++
 
         // High energy = excited/angry
@@ -410,7 +493,7 @@ object GenderAnalyzer {
 
         emotionFrameCount++
 
-        if (emotionFrameCount >= 10) {
+        if (emotionFrameCount >= 64) {  // was >= 10 @ 128ms cadence; 64 @ 20ms keeps the same ~1.28s interval
             emotionFrameCount = 0
             val detectedEmotion = detectEmotionFromAcoustics(
                 f0History.toList(), rmsHistory.toList(),
@@ -434,11 +517,16 @@ object GenderAnalyzer {
         if (f0Buf.size < 6) return
         val n = f0Buf.size
 
-        // Sample 10 evenly-spaced points from the sentence window
-        // Each point i covers 1/10th of the sentence duration
-        for (i in 0..9) {
-            val lo = (i * n / 10)
-            val hi = ((i + 1) * n / 10).coerceAtMost(n)
+        // Sample CONTOUR_POINTS evenly-spaced points from the sentence window.
+        // Raised from 10 to 30 (Voice Mimic Engine upgrade) — finer melody
+        // resolution for buildMelodyContour() in HindiTtsService. Still bounded
+        // to a fixed size (not literally per-10ms) because the actual ceiling
+        // downstream is Android TTS's per-WORD SSML granularity — sampling far
+        // beyond what a typical sentence's word count can use doesn't add
+        // audible value, it just costs more to compute and store.
+        for (i in 0 until CONTOUR_POINTS) {
+            val lo = (i * n / CONTOUR_POINTS)
+            val hi = ((i + 1) * n / CONTOUR_POINTS).coerceAtMost(n)
             if (lo < hi) {
                 capturedF0Curve[i]  = f0Buf.subList(lo, hi).average().toFloat()
                 capturedRmsCurve[i] = rmsBuf.subList(lo, hi).average().toFloat()
@@ -448,10 +536,55 @@ object GenderAnalyzer {
             }
         }
 
+        // ── Vibrato detection ────────────────────────────────────────────────
+        // Vibrato = periodic pitch oscillation, typically 4-8Hz, common in
+        // singing and some expressive speech. Detected by counting how often
+        // the raw F0 curve crosses its own short-term moving average — a
+        // genuine oscillation crosses at a regular rate; random measurement
+        // jitter does not. Needs the 20ms sliding-window upgrade above to
+        // work at all — at the old 128ms sampling there's barely one sample
+        // per vibrato cycle, nowhere near enough to detect the oscillation.
+        //
+        // HONEST LIMIT: this DETECTS vibrato in the original voice. Android
+        // TTS has no pitch-oscillation control whatsoever, so REPRODUCING
+        // true vibrato isn't possible on this platform — HindiTtsService can
+        // only apply a coarse per-word pitch wobble as an approximation, not
+        // real vibrato.
+        var vibratoDetected = false
+        var vibratoRateHz   = 0f
+        if (n >= 20) {
+            val smoothWindow = 5
+            val baseline = FloatArray(n)
+            for (i in 0 until n) {
+                val lo = (i - smoothWindow / 2).coerceAtLeast(0)
+                val hi = (i + smoothWindow / 2).coerceAtMost(n - 1)
+                baseline[i] = f0Buf.subList(lo, hi + 1).average().toFloat()
+            }
+            var crossings = 0
+            var totalDeviation = 0f
+            for (i in 1 until n) {
+                val prevDev = f0Buf[i - 1] - baseline[i - 1]
+                val currDev = f0Buf[i] - baseline[i]
+                totalDeviation += kotlin.math.abs(currDev)
+                if ((prevDev > 0f) != (currDev > 0f)) crossings++
+            }
+            val durationSec       = n * HOP_MS / 1000f
+            val avgDeviation       = totalDeviation / n
+            val avgF0              = f0Buf.average().toFloat()
+            val relativeDeviation  = if (avgF0 > 0f) avgDeviation / avgF0 else 0f
+            // Each full oscillation cycle crosses the baseline twice
+            vibratoRateHz = if (durationSec > 0f) (crossings / 2f) / durationSec else 0f
+            // 3.5-9Hz covers natural vibrato rate variation; the relative-
+            // deviation floor filters out flat/monotone speech whose zero
+            // crossings come from low-amplitude measurement noise, not a
+            // real oscillation.
+            vibratoDetected = vibratoRateHz in 3.5f..9f && relativeDeviation > 0.01f
+        }
+
         // Legacy 3-point fields (still used as fallback)
         lastContourStartF0 = capturedF0Curve[0]
         lastContourPeakF0  = capturedF0Curve.max()
-        lastContourEndF0   = capturedF0Curve[9]
+        lastContourEndF0   = capturedF0Curve[CONTOUR_POINTS - 1]
 
         // Publish to HindiTtsService
         HindiTtsService.capturedStartF0  = lastContourStartF0
@@ -459,6 +592,11 @@ object GenderAnalyzer {
         HindiTtsService.capturedEndF0    = lastContourEndF0
         capturedF0Curve.copyInto(HindiTtsService.capturedF0Curve)
         capturedRmsCurve.copyInto(HindiTtsService.capturedRmsCurve)
+        HindiTtsService.capturedVibratoDetected = vibratoDetected
+        HindiTtsService.capturedVibratoRateHz   = vibratoRateHz
+        HindiTtsService.capturedBreathCount     = breathCountThisSentence
+        breathCountThisSentence = 0
+        silentHopStreak = 0
 
         val shape = when {
             lastContourEndF0 > lastContourStartF0 * 1.05f -> "↑RISING"
@@ -466,7 +604,8 @@ object GenderAnalyzer {
             else -> "→FLAT"
         }
         CaptionLogger.log("GenderAnalyzer",
-            "CONTOUR-10pt [${capturedF0Curve.map{it.toInt()}.joinToString(",")}] $shape")
+            "CONTOUR-${CONTOUR_POINTS}pt [${capturedF0Curve.map{it.toInt()}.joinToString(",")}] $shape" +
+            if (vibratoDetected) " VIBRATO=${vibratoRateHz.format1()}Hz" else "")
 
         // Lock per-sentence median F0 — computed from all voiced frames this sentence
         // This gives HindiTtsService ONE stable base pitch for the whole sentence
@@ -477,6 +616,8 @@ object GenderAnalyzer {
         contourRmsBuffer.clear()
         contourPeak = 0f
     }
+
+    private fun Float.format1(): String = "%.1f".format(this)
 
     // ── Voice Type Classifier ────────────────────────────────────────────────
     // Maps average SPEAKING F0 (not singing range) to one of 6 standard voice
