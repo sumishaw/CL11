@@ -701,30 +701,34 @@ class LiveCaptionReader : AccessibilityService() {
         }
 
         // ── RULE 4: SMART SILENCE GAP ────────────────────────────────────────
-        // Uses /is_complete to decide silence duration:
+        // Uses isCompleteSentence() (local dangling-word check + /is_complete
+        // network check, see that function) to decide silence duration:
         //   Complete sentence (e.g. "Funny, I'm so sorry.") → 500ms wait
-        //   Incomplete fragment (e.g. "But the end of") → 1400ms wait
-        // This prevents flooding CT2 with tiny mid-sentence fragments from rapid dialogue.
+        //   Incomplete fragment (e.g. "But the end of") → 1600ms wait
+        // This prevents flooding CT2 with tiny mid-sentence fragments from
+        // rapid dialogue, AND — this is the important part for translation
+        // grammar — gives a genuinely incomplete fragment real extra time
+        // for the rest of the clause to arrive before firing anyway, rather
+        // than translating "I am going" and "to the store" as two separate,
+        // un-reorderable CT2 calls. Still bounded: if the speaker really did
+        // stop (trailed off, interrupted), it fires after the wait either way
+        // — this delays incomplete fragments, it doesn't block them forever.
         sentenceTimerJob?.cancel(); pendingJob?.cancel()
         if (newWords >= 3) {
             sentenceTimerJob = scope.launch {
-                // Quick check: is the current buffer a complete sentence?
                 val t = sentenceBuffer.trim()
-                val silenceMs = if (wc(t) >= 10) {
-                    // Long text — definitely translate after short silence
+                // FIX: previously skipped the completeness check entirely
+                // for 10+ word text, assuming length alone meant it was safe
+                // to fire fast — but a long fragment can still end mid-clause
+                // ("...was because of the fact that the weather conditions
+                // were extremely") just as easily as a short one.
+                val complete = withContext(Dispatchers.IO) { isCompleteSentence(t) }
+                val silenceMs = if (complete) {
+                    CaptionLogger.log(TAG, "SMART-COMPLETE wc=${wc(t)} — fast silence 500ms")
                     500L
-                } else if (wc(t) >= 5) {
-                    // Medium: check completeness (local call, <5ms)
-                    val complete = withContext(Dispatchers.IO) { isCompleteSentence(t) }
-                    if (complete) {
-                        CaptionLogger.log(TAG, "SMART-COMPLETE wc=${wc(t)} — fast silence 500ms")
-                        500L   // complete sentence: translate quickly
-                    } else {
-                        CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — silence 700ms")
-                        700L   // 700ms: faster response for rapid dialogue
-                    }
                 } else {
-                    900L  // short text: 900ms (was 1400ms — too slow for dialogue)
+                    CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — silence 1600ms (was 700ms — too little buffer for the rest of the clause to arrive)")
+                    1600L
                 }
                 delay(silenceMs)
                 val t2 = sentenceBuffer.trim()
@@ -902,7 +906,46 @@ class LiveCaptionReader : AccessibilityService() {
         translateJob2 = scope.launch { workerLoop("W2") }
     }
 
+    // Words that strongly signal the clause is NOT grammatically complete —
+    // a sentence ending on any of these is almost always mid-thought,
+    // regardless of word count. Checked locally (no network round-trip),
+    // so it can't be defeated by server latency the way isCompleteSentence()
+    // below can. This is what makes RULE 4's fast-chunking "smarter" rather
+    // than just word-count-based: a chunk isn't considered safe to
+    // translate early just because it hit 3+ words, if it ends on one of
+    // these — that's exactly the case that breaks grammar when English and
+    // Hindi have different word order (SVO vs SOV, adjective placement, etc.)
+    private val DANGLING_WORDS = setOf(
+        // Prepositions
+        "to", "in", "on", "at", "of", "for", "with", "by", "from", "into",
+        "onto", "about", "over", "under", "through", "during", "before",
+        "after", "between", "among", "against", "without", "within",
+        // Articles
+        "a", "an", "the",
+        // Coordinating conjunctions
+        "and", "but", "or", "nor", "so", "yet",
+        // Subordinating conjunctions / relative words — these specifically
+        // introduce a clause that hasn't been completed yet
+        "because", "since", "although", "though", "while", "if", "when",
+        "unless", "that", "which", "who", "whom", "whose", "where", "as",
+        // Bare auxiliary/helping verbs — need a main verb to complete
+        "is", "am", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "will", "would", "shall", "should",
+        "can", "could", "may", "might", "must", "do", "does", "did",
+    )
+
+    private fun endsWithDanglingWord(text: String): Boolean {
+        val lastWord = text.trim().trimEnd('.', '!', '?', ',', ';', ':')
+            .substringAfterLast(' ').lowercase()
+        return lastWord in DANGLING_WORDS
+    }
+
     private fun isCompleteSentence(text: String): Boolean {
+        // Local check first — reliable, instant, can't be broken by server
+        // latency. If the text ends on a dangling word, it's not complete,
+        // full stop — no need to even ask the server.
+        if (endsWithDanglingWord(text)) return false
+
         return try {
             val enc = java.net.URLEncoder.encode(text.trim(), "UTF-8")
             val conn = java.net.URL("$IS_COMPLETE_URL?text=$enc")
@@ -913,8 +956,18 @@ class LiveCaptionReader : AccessibilityService() {
                 val resp = conn.inputStream.bufferedReader().readText()
                 conn.disconnect()
                 resp.contains("\"complete\": true") || resp.contains("\"complete\":true")
-            } else { conn.disconnect(); true }
-        } catch (e: Exception) { true }
+            } else { conn.disconnect(); false }
+        } catch (e: Exception) {
+            // FIX: was `true` — defaulting to "complete" on ANY network
+            // failure (timeout, error, unreachable) meant this check was
+            // silently disabled whenever the server was under load, which
+            // is common in this app given everything else running
+            // concurrently (Whisper, CT2, TTS). Defaulting to `false`
+            // (not complete) means a failed check waits longer instead of
+            // firing early on an unverified fragment — the safer direction
+            // for this specific tradeoff.
+            false
+        }
     }
 
     private suspend fun workerLoop(name: String) {
