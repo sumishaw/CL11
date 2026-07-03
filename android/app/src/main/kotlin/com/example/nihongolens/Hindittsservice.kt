@@ -225,6 +225,7 @@ object HindiTtsService {
     // wobble approximation," not "reproduce real vibrato."
     @Volatile var capturedVibratoDetected: Boolean = false
     @Volatile var capturedVibratoRateHz:   Float   = 0f
+    @Volatile var capturedVibratoDepth:    Float   = 0f  // relative pitch deviation — how pronounced the oscillation is
     // Count of likely breath pauses detected in the ORIGINAL audio this
     // sentence. Does NOT map to specific positions in the Hindi translation
     // (translated word count/order/timing doesn't correspond 1:1 to the
@@ -922,19 +923,23 @@ object HindiTtsService {
         val meanRms  = if (validRms.isNotEmpty()) validRms.average().toFloat() else 0f
 
         val basePct    = basePitchPct.removeSuffix("%").toFloatOrNull() ?: 0f
-        val maxStepPct = 10f   // wider than speech's 6% — singing's larger pitch swings need more room per step
+        val maxStepPct = 11f   // raised slightly from 10f — confirmed working, pushing melody fidelity further
         var prevPct    = basePct
 
         val maxRateStepPct = 12f
         var prevRatePct    = 100f
 
-        // Vibrato wobble scaled to the ACTUAL measured rate — faster
-        // detected vibrato alternates more per word, slower vibrato less so,
-        // rather than a fixed word-to-word flip. Still word-granularity
-        // (Android TTS has no finer time control), so this is a rough
-        // rate-aware approximation, not a real reproduction.
-        val vibratoAmplitude = if (capturedVibratoDetected)
-            (capturedVibratoRateHz / 6f * 5f).coerceIn(3f, 8f) else 0f
+        // Vibrato wobble scaled to BOTH the measured rate AND depth — faster
+        // AND more pronounced measured vibrato both push the wobble amplitude
+        // up; a fast-but-shallow or slow-but-deep vibrato both get a more
+        // proportionate approximation than rate alone gave. Still word-
+        // granularity (Android TTS has no finer time control), so this
+        // remains a rough approximation, not a real reproduction.
+        val vibratoAmplitude = if (capturedVibratoDetected) {
+            val rateFactor  = (capturedVibratoRateHz / 6f).coerceIn(0.5f, 1.5f)
+            val depthFactor = (capturedVibratoDepth / 0.03f).coerceIn(0.5f, 2f)
+            (5f * rateFactor * depthFactor).coerceIn(3f, 10f)
+        } else 0f
 
         val breathCount = capturedBreathCount.coerceIn(0, words.size - 1)
         val breathAfterWordIdx: Set<Int> = if (breathCount > 0) {
@@ -948,7 +953,7 @@ object HindiTtsService {
             // 1.1x deviation scale (vs speech's 0.6x) — follow the melody
             // more faithfully; singing's pitch swings are supposed to be
             // prominent, not smoothed toward flat like conversational speech
-            var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 1.1f) else 0f
+            var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 1.25f) else 0f
 
             var sustainScore = 0f  // how "held" this word's energy region is
             if (meanRms > 0f && curveIdx < rmsCurve.size) {
