@@ -352,6 +352,41 @@ object HindiTtsService {
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
 
+    // ── Bounded play-queue backlog (Speech Engine upgrade) ────────────────────
+    // PREVIOUSLY: playQueue grew without bound — if synthesis kept up faster
+    // than actual audio playback could consume it (each clip takes real
+    // seconds to physically play), the gap between "when something was
+    // translated" and "when you actually hear it" grew continuously and
+    // never recovered — observed in the field growing from ~73s to ~80s
+    // and climbing within a single short test. Since subtitles are shown
+    // immediately on translation (see deliverHindi() in LiveCaptionReader)
+    // while audio could lag over a minute behind, this is also what was
+    // making "subtitle synchronization" feel broken — the two were
+    // increasingly out of sync via the audio side, not the subtitle side.
+    //
+    // NOW: total queued audio duration is capped. When a new item would
+    // push the queue over the cap, the OLDEST queued items are dropped
+    // (not played) until there's room — trading "every sentence eventually
+    // gets spoken" for "stays close to real-time," which is what dubbing a
+    // live video actually needs. This is a deliberate trade-off: some
+    // sentences will now be silently skipped during a genuine backlog
+    // instead of playing minutes late.
+    private const val MAX_PLAY_BACKLOG_MS = 8_000L
+
+    private fun offerToPlayQueue(item: PlayItem) {
+        playQueue.offer(item)
+        // LinkedBlockingQueue's iterator is weakly-consistent — safe to sum
+        // concurrently with the play worker's take(), at worst slightly
+        // stale, which is fine for a best-effort cap like this.
+        var totalMs = playQueue.sumOf { it.durMs }
+        while (totalMs > MAX_PLAY_BACKLOG_MS && playQueue.size > 1) {
+            val dropped = playQueue.poll() ?: break
+            totalMs -= dropped.durMs
+            try { dropped.wavFile.delete() } catch (_: Exception) {}
+            CaptionLogger.log(TAG, "PLAY-SKIP-AHEAD dropped '${dropped.text.take(30)}' (backlog catch-up, ${totalMs}ms remaining queued)")
+        }
+    }
+
     // Debug accessors for CaptionLogger state snapshot
     fun fetchQueueSize() = fetchQueue.size
 
@@ -613,7 +648,7 @@ object HindiTtsService {
                 val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
 
                 CaptionLogger.log(TAG, "TTS-WAV[$workerName] ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
-                playQueue.offer(PlayItem(textToSpeak, mixedFile, durMs))
+                offerToPlayQueue(PlayItem(textToSpeak, mixedFile, durMs))
             } catch (e: CancellationException) {
                 throw e  // let real cancellation (session stop) propagate normally
             } catch (e: Exception) {
@@ -760,8 +795,15 @@ object HindiTtsService {
         val meanRms  = if (validRms.isNotEmpty()) validRms.average().toFloat() else 0f
 
         val basePct = basePitchPct.removeSuffix("%").toFloatOrNull() ?: 0f
-        val maxStepPct = 6f   // cap per-word change to avoid staircase jumps
+        val maxStepPct = 6f   // cap per-word pitch change to avoid staircase jumps
         var prevPct = basePct
+
+        // Word-level pacing (Speech Engine upgrade): rate is expressed as an
+        // ABSOLUTE percentage in SSML (e.g. "105%"), unlike pitch's relative
+        // "+N%"/"-N%" — so this tracks its own baseline around 100%, capped
+        // the same way to avoid choppy word-to-word pacing changes.
+        val maxRateStepPct = 8f
+        var prevRatePct = 100f
 
         // Breath-based pauses: distribute capturedBreathCount short breaks
         // roughly evenly across the word sequence. This is a genuine
@@ -787,13 +829,15 @@ object HindiTtsService {
             var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 0.6f) else 0f
 
             // Energy matching: words spoken louder than the sentence's own
-            // average get a small extra lift, quieter words a small dip —
-            // nudges emphasis toward where the original speaker actually
-            // pushed energy, using the already-captured RMS curve.
+            // average get a small extra pitch lift, quieter words a small
+            // dip — nudges emphasis toward where the original speaker
+            // actually pushed energy, using the already-captured RMS curve.
+            // The same ratio also drives word-level pacing below.
+            var energyRatio = 0f
             if (meanRms > 0f && curveIdx < rmsCurve.size) {
                 val rawRms = rmsCurve[curveIdx]
                 if (rawRms > 0f) {
-                    val energyRatio = (rawRms - meanRms) / meanRms
+                    energyRatio = (rawRms - meanRms) / meanRms
                     deviationPct += (energyRatio * 8f).coerceIn(-6f, 6f)
                 }
             }
@@ -807,7 +851,17 @@ object HindiTtsService {
             prevPct = steppedPct
             val pctStr = if (steppedPct >= 0) "+${steppedPct.toInt()}%" else "${steppedPct.toInt()}%"
 
-            val wordTag = "<prosody pitch='$pctStr'>${android.text.Html.escapeHtml(w)}</prosody>"
+            // Word-level pacing: higher-energy (typically emphasized/
+            // stressed) words spoken slightly more deliberately (slower),
+            // lower-energy (de-emphasized/filler) words slightly faster.
+            // Small effect (85-115%) so it nudges pacing without sounding
+            // choppy — "word-by-word pacing," not a dramatic rate swing.
+            val targetRatePct  = (100f - (energyRatio * 15f)).coerceIn(85f, 115f)
+            val steppedRatePct = prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
+            prevRatePct = steppedRatePct
+            val ratePctStr = "${steppedRatePct.toInt()}%"
+
+            val wordTag = "<prosody pitch='$pctStr' rate='$ratePctStr'>${android.text.Html.escapeHtml(w)}</prosody>"
             if (i in breathAfterWordIdx) "$wordTag<break time='180ms'/>" else wordTag
         }.joinToString(" ")
 
