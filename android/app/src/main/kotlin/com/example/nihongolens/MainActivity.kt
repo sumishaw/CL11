@@ -148,7 +148,7 @@ class MainActivity : FlutterActivity() {
 
                 "setHindiSubtitleHidden" -> {
                     val hidden = call.argument<Boolean>("hidden") ?: false
-                    OverlayService.setSubtitleHidden(hidden)
+                    OverlayService.applySubtitleHidden(hidden)
                     result.success(true)
                 }
 
