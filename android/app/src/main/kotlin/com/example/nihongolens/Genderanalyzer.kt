@@ -35,7 +35,7 @@ object GenderAnalyzer {
     // STABILITY FIX: Increased from 3 → 12 frames (was switching on 2/3 frames = ~256ms)
     // Now needs 8/12 consecutive frames to switch = ~768ms of sustained pitch change
     // Prevents rapid MALE↔FEMALE oscillation that caused spokenTokens.clear() spam → skipped sentences
-    private const val HIST         = 77          // ~768ms majority window at 20ms cadence (was 12 @ 128ms cadence)
+    private const val HIST         = 12          // ~1.5s majority window — receives DECIMATED gender-vote samples (~120ms apart, see GENDER_VOTE_DECIMATION), not every raw 20ms pitch reading
 
     // Minimum milliseconds between gender switches — prevents double-switching within one sentence
     // Even with HIST=12, rapid pitch variation (music, noise) can still flip quickly
@@ -79,6 +79,13 @@ object GenderAnalyzer {
     private const val HOP_MS      = 20
     private val HOP_SAMPLES       = (SR * HOP_MS / 1000).coerceAtLeast(1)
     private val hopStage          = ShortArray(HOP_SAMPLES)
+
+    // Gender-vote decimation (see the fix comment at the history.addLast
+    // call site in onPitch() for the full explanation). 6 hops * 20ms = 120ms,
+    // approximating the original ~128ms cadence this majority-vote logic
+    // was designed and tuned around.
+    private var genderVoteFrameCount = 0
+    private const val GENDER_VOTE_DECIMATION = 6
     private var hopFill           = 0
 
     private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -374,36 +381,60 @@ object GenderAnalyzer {
         if (frameCount % 32 == 0)  // was % 5 @ 128ms cadence; 32 @ 20ms keeps the same ~640ms interval
             CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender")
 
-        history.addLast(gender)
-        if (history.size > HIST) history.removeFirst()
+        // ── Gender vote decimation ───────────────────────────────────────────
+        // FIX: feeding every 20ms sliding-window reading directly into the
+        // gender majority vote made a single momentary pitch-detection
+        // glitch (YIN octave error, or a brief natural vocal inflection)
+        // much more dangerous than before. Consecutive sliding-window
+        // readings share ~84% of their underlying audio samples, so a
+        // glitch tends to produce the SAME wrong reading many times in a
+        // row — turning one momentary error into a sustained streak long
+        // enough to tip the majority vote within its window. The OLD
+        // non-overlapping 128ms windows didn't have this problem: each
+        // reading came from entirely fresh audio, so an error couldn't
+        // persist. This is very likely the cause of "male voice briefly
+        // flips to female mid-sentence."
+        // FIX: only feed the gender vote once every GENDER_VOTE_DECIMATION
+        // hops (~120ms, restoring roughly the original independent-ish
+        // sample spacing) instead of every single 20ms reading. Contour/
+        // vibrato/melody/emotion detection below are UNAFFECTED — they
+        // still use the full 20ms resolution, which is genuinely needed
+        // there and isn't vulnerable to this same correlation problem
+        // (they don't do a hard majority-vote switch decision).
+        genderVoteFrameCount++
+        if (genderVoteFrameCount >= GENDER_VOTE_DECIMATION) {
+            genderVoteFrameCount = 0
+            history.addLast(gender)
+            if (history.size > HIST) history.removeFirst()
 
-        val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
-        val maj    = if (fCount > history.size * 2 / 3) HindiTtsService.Gender.FEMALE
-                     else if (fCount < history.size / 3)   HindiTtsService.Gender.MALE
-                     else                                   HindiTtsService.detectedGender // no majority → keep current
+            val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
+            val maj    = if (fCount > history.size * 2 / 3) HindiTtsService.Gender.FEMALE
+                         else if (fCount < history.size / 3)   HindiTtsService.Gender.MALE
+                         else                                   HindiTtsService.detectedGender // no majority → keep current
 
-        val nowMs = System.currentTimeMillis()
-        // Extra guard: don't switch gender if RMS indicates silence/music
-        // Low RMS = speaker has stopped talking — pitch reading is noise
-        val isSilenceOrMusic = rms < 120f
-        if (maj != HindiTtsService.detectedGender &&
-            nowMs - lastSwitchMs >= MIN_SWITCH_INTERVAL_MS &&
-            !isSilenceOrMusic) {
-            lastSwitchMs = nowMs
-            HindiTtsService.detectedGender = maj
-            // Don't clear spokenTokens on switch — sentences in flight stay valid
-            // Only clear if user explicitly wants re-speak (e.g. via stopAndClear)
-            lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
-            CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
-            Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
-            // New speaker confirmed — switch voice, seed new gender's F0 buffer
-            voiceTypeF0History.clear()
-            // Seed the new gender's F0 buffer with current measurement
-            // rather than clearing to zero (which causes pitch=1.0 for 1-2 sentences)
-            HindiTtsService.currentMeasuredF0 = f0.takeIf { it > 60f } ?: 0f
-            HindiTtsService.seedSentenceF0(f0, maj)  // smooth gender transition
-            // Reset Hindi dedup so new speaker's first sentence is never skipped
-            LiveCaptionReader.instance?.resetHindiDedup()
+            val nowMs = System.currentTimeMillis()
+            // Extra guard: don't switch gender if RMS indicates silence/music
+            // Low RMS = speaker has stopped talking — pitch reading is noise
+            val isSilenceOrMusic = rms < 120f
+            if (maj != HindiTtsService.detectedGender &&
+                nowMs - lastSwitchMs >= MIN_SWITCH_INTERVAL_MS &&
+                !isSilenceOrMusic) {
+                lastSwitchMs = nowMs
+                HindiTtsService.detectedGender = maj
+                // Don't clear spokenTokens on switch — sentences in flight stay valid
+                // Only clear if user explicitly wants re-speak (e.g. via stopAndClear)
+                lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
+                CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
+                Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
+                // New speaker confirmed — switch voice, seed new gender's F0 buffer
+                voiceTypeF0History.clear()
+                // Seed the new gender's F0 buffer with current measurement
+                // rather than clearing to zero (which causes pitch=1.0 for 1-2 sentences)
+                HindiTtsService.currentMeasuredF0 = f0.takeIf { it > 60f } ?: 0f
+                HindiTtsService.seedSentenceF0(f0, maj)  // smooth gender transition
+                // Reset Hindi dedup so new speaker's first sentence is never skipped
+                LiveCaptionReader.instance?.resetHindiDedup()
+            }
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
