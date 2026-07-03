@@ -552,6 +552,7 @@ object GenderAnalyzer {
         // real vibrato.
         var vibratoDetected = false
         var vibratoRateHz   = 0f
+        var vibratoDepth    = 0f  // relative pitch deviation — how PRONOUNCED the oscillation is, not just how fast
         if (n >= 20) {
             val smoothWindow = 5
             val baseline = FloatArray(n)
@@ -574,6 +575,7 @@ object GenderAnalyzer {
             val relativeDeviation  = if (avgF0 > 0f) avgDeviation / avgF0 else 0f
             // Each full oscillation cycle crosses the baseline twice
             vibratoRateHz = if (durationSec > 0f) (crossings / 2f) / durationSec else 0f
+            vibratoDepth  = relativeDeviation
             // 3.5-9Hz covers natural vibrato rate variation; the relative-
             // deviation floor filters out flat/monotone speech whose zero
             // crossings come from low-amplitude measurement noise, not a
@@ -629,6 +631,7 @@ object GenderAnalyzer {
         capturedRmsCurve.copyInto(HindiTtsService.capturedRmsCurve)
         HindiTtsService.capturedVibratoDetected = vibratoDetected
         HindiTtsService.capturedVibratoRateHz   = vibratoRateHz
+        HindiTtsService.capturedVibratoDepth    = vibratoDepth
         HindiTtsService.capturedBreathCount     = breathCountThisSentence
         HindiTtsService.capturedSingingDetected = singingDetected
         breathCountThisSentence = 0
@@ -703,18 +706,52 @@ object GenderAnalyzer {
         // Singing: sustained high F0 (>250Hz), stable pitch (low std)
         if (sustainedHigh >= 5 && f0Std < 30f) return HindiTtsService.Emotion.SINGING
 
-        // Excited: rising pitch + high energy
-        if (rising >= 4 && highEnergy >= 3 && f0Mean > 190f)
-            return HindiTtsService.Emotion.EXCITED
+        // ── REORDERED (specificity-first) ─────────────────────────────────────
+        // This is a sequential if-chain — the FIRST matching condition wins,
+        // silently blocking every emotion checked after it even if their
+        // condition would also have matched. The original order let broad,
+        // loosely-constrained conditions run before narrow, specific ones,
+        // which meant several emotions were effectively unreachable in
+        // realistic audio:
+        //   - WARM (f0Std<28, f0Mean 95-210, highEnergy<3) was checked before
+        //     COMMANDING/CONSOLING/WHISPERY/TAUNTING, whose own ranges sit
+        //     almost entirely INSIDE WARM's — so WARM caught them first
+        //     nearly every time.
+        //   - HAPPY (rising>=2, f0Mean>150, highEnergy>=1 — a very low bar)
+        //     was positioned early enough to plausibly intercept SURPRISED/
+        //     FEARFUL/ANGRY, all of which naturally involve some rising
+        //     pitch too.
+        // FIX: reordered narrowest/most-constrained conditions first, down
+        // to the broadest catch-alls (HAPPY, then WARM) last. Every
+        // threshold VALUE below is UNCHANGED from before — only the order
+        // they're checked in is different. This is a lower-risk fix than
+        // retuning the numbers themselves, which I can't validate without
+        // real audio testing.
 
-        // Happy: rising pitch, moderate energy (loosened: was rising>=3, f0Mean>170 — too strict
-        // for normal upbeat speech that doesn't reach excited-level highs)
-        if (rising >= 2 && f0Mean > 150f && highEnergy >= 1)
-            return HindiTtsService.Emotion.HAPPY
+        // COMMANDING: very low F0, very low variance (steady authoritative voice)
+        if (f0Mean < 105f && f0Std < 12f && rmsMean > 1200f)
+            return HindiTtsService.Emotion.COMMANDING
 
         // Surprised: sudden high F0 spike with high variation
         if (currentF0 > 260f && f0Std > 35f)
             return HindiTtsService.Emotion.SURPRISED
+
+        // PANICKING: extremely fast + very high pitch + high energy together
+        if (rising >= 5 && f0Mean > 220f && highEnergy >= 4 && rmsMean > 2000f)
+            return HindiTtsService.Emotion.PANICKING
+
+        // SHOUTING: very high RMS + fast rate + not too high pitch (yelling, not fearful)
+        if (rmsMean > 4000f && highEnergy >= 6 && f0Std > 15f && f0Mean < 210f)
+            return HindiTtsService.Emotion.SHOUTING
+
+        // SOBBING: very low F0, very slow, low energy — deep grief
+        if (f0Mean < 120f && falling >= 4 && rmsMean < 700f)
+            return HindiTtsService.Emotion.SOBBING
+
+        // CRYING: high pitch + irregular/unstable F0 (voice breaks) + moderate pace
+        // F0 instability (high std relative to mean) is the key marker
+        if (f0Mean > 175f && f0Std > 35f && highEnergy < 4 && rmsMean in 500f..2500f)
+            return HindiTtsService.Emotion.CRYING
 
         // Fearful: high variable pitch, not high energy
         if (f0Mean > 210f && f0Std > 25f && highEnergy < 3)
@@ -724,42 +761,9 @@ object GenderAnalyzer {
         if (highEnergy >= 4 && f0Std > 20f && rmsMean > 1500f)
             return HindiTtsService.Emotion.ANGRY
 
-        // Sighing: falling pitch, low energy
-        if (falling >= 5 && rmsMean < 1000f)
-            return HindiTtsService.Emotion.SIGHING
-
-        // Sad: falling pitch, low F0 overall
-        if (falling >= 3 && f0Mean < 140f && rmsMean < 1200f)
-            return HindiTtsService.Emotion.SAD
-
-        // Warm: stable smooth mid F0, calm (loosened: was f0Std<20, narrow 110-185Hz band
-        // — widened so normal calm/engaged conversational speech qualifies more often
-        // instead of defaulting to flat NEUTRAL)
-        if (f0Std < 28f && f0Mean in 95f..210f && highEnergy < 3)
-            return HindiTtsService.Emotion.WARM
-
-        // Whispery: very low RMS (quiet speech)
-        if (rmsMean < 400f && f0Std < 25f)
-            return HindiTtsService.Emotion.WHISPERY
-
-        // ── New expressive emotions ───────────────────────────────────────────
-
-        // SHOUTING: very high RMS + fast rate + not too high pitch (yelling, not fearful)
-        if (rmsMean > 4000f && highEnergy >= 6 && f0Std > 15f && f0Mean < 210f)
-            return HindiTtsService.Emotion.SHOUTING
-
-        // PANICKING: extremely fast + very high pitch + high energy together
-        if (rising >= 5 && f0Mean > 220f && highEnergy >= 4 && rmsMean > 2000f)
-            return HindiTtsService.Emotion.PANICKING
-
-        // CRYING: high pitch + irregular/unstable F0 (voice breaks) + moderate pace
-        // F0 instability (high std relative to mean) is the key marker
-        if (f0Mean > 175f && f0Std > 35f && highEnergy < 4 && rmsMean in 500f..2500f)
-            return HindiTtsService.Emotion.CRYING
-
-        // SOBBING: very low F0, very slow, low energy — deep grief
-        if (f0Mean < 120f && falling >= 4 && rmsMean < 700f)
-            return HindiTtsService.Emotion.SOBBING
+        // Excited: rising pitch + high energy
+        if (rising >= 4 && highEnergy >= 3 && f0Mean > 190f)
+            return HindiTtsService.Emotion.EXCITED
 
         // LAUGHING: rapid rhythmic energy bursts + high pitch
         if (highEnergy >= 3 && rising >= 3 && f0Mean > 190f && f0Std > 20f)
@@ -768,10 +772,6 @@ object GenderAnalyzer {
         // PLEADING: rapidly rising F0, moderate-high energy, urgent
         if (rising >= 4 && f0Mean in 155f..210f && rmsMean in 1000f..3500f)
             return HindiTtsService.Emotion.PLEADING
-
-        // COMMANDING: very low F0, very low variance (steady authoritative voice)
-        if (f0Mean < 105f && f0Std < 12f && rmsMean > 1200f)
-            return HindiTtsService.Emotion.COMMANDING
 
         // WHINING: high pitch, falling, low-moderate energy (complaint tone)
         if (f0Mean > 180f && falling >= 3 && rmsMean < 1500f && f0Std < 25f)
@@ -784,6 +784,29 @@ object GenderAnalyzer {
         // CONSOLING: low-mid pitch, falling, warm, soft
         if (f0Mean in 100f..155f && falling >= 2 && rmsMean < 1000f && f0Std < 18f)
             return HindiTtsService.Emotion.CONSOLING
+
+        // Sighing: falling pitch, low energy
+        if (falling >= 5 && rmsMean < 1000f)
+            return HindiTtsService.Emotion.SIGHING
+
+        // Sad: falling pitch, low F0 overall
+        if (falling >= 3 && f0Mean < 140f && rmsMean < 1200f)
+            return HindiTtsService.Emotion.SAD
+
+        // Whispery: very low RMS (quiet speech)
+        if (rmsMean < 400f && f0Std < 25f)
+            return HindiTtsService.Emotion.WHISPERY
+
+        // Happy: rising pitch, moderate energy (loosened: was rising>=3, f0Mean>170 — too strict
+        // for normal upbeat speech that doesn't reach excited-level highs)
+        if (rising >= 2 && f0Mean > 150f && highEnergy >= 1)
+            return HindiTtsService.Emotion.HAPPY
+
+        // Warm: stable smooth mid F0, calm (loosened: was f0Std<20, narrow 110-185Hz band
+        // — widened so normal calm/engaged conversational speech qualifies more often
+        // instead of defaulting to flat NEUTRAL)
+        if (f0Std < 28f && f0Mean in 95f..210f && highEnergy < 3)
+            return HindiTtsService.Emotion.WARM
 
         return HindiTtsService.Emotion.NEUTRAL
     }
